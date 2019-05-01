@@ -1,0 +1,9 @@
+C:$name=abc
+C:#abc=123
+T:100\$
+T:$name
+T:\$name
+T:\\zippo
+T:\
+T:#abc
+T:\#abc

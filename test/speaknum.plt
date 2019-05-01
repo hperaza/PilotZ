@@ -1,0 +1,78 @@
+R :speaknum.p --- translate numbers to English
+  :	$Id: speaknum.p,v 1.1 1991/11/23 06:11:58 eric Exp $
+  :
+  :(ESR) This is included primarily for its joke value.  Not that it was
+  :*intended* to be humorous...
+  :
+*LOOP
+T	:ENTER A NUMBER, OR ZERO TO QUIT.
+C	:$NUM=
+A	:#Z
+E(Z=0)	:
+U	:*WRITNUM
+T	:$NUM
+	:
+J	:*LOOP
+
+*WRITNUM
+U(Z<10)	:*UNITS
+E(Z<10)	:
+J(Z>999):*THOU
+J(Z>99)	:*HUND
+J(Z>19)	:*TWENTY
+C(Z=10)	:$NUM=$NUM TEN
+C(Z=11)	:$NUM=$NUM ELEVEN
+C(Z=12)	:$NUM=$NUM TWELVE
+C(Z=13)	:$NUM=$NUM THIRTEEN
+C(Z=14)	:$NUM=$NUM FOURTEEN
+C(Z=15)	:$NUM=$NUM FIFTEEN
+C(Z=16)	:$NUM=$NUM SIXTEEN
+C(Z=17)	:$NUM=$NUM SEVENTEEN
+C(Z=18)	:$NUM=$NUM EIGHTEEN
+C(Z=19)	:$NUM=$NUM NINETEEN
+E:
+
+*UNITS
+C(Z=1)	:$NUM=$NUM ONE
+C(Z=2)	:$NUM=$NUM TWO
+C(Z=3)	:$NUM=$NUM THREE
+C(Z=4)	:$NUM=$NUM FOUR
+C(Z=5)	:$NUM=$NUM FIVE
+C(Z=6)	:$NUM=$NUM SIX
+C(Z=7)	:$NUM=$NUM SEVEN
+C(Z=8)	:$NUM=$NUM EIGHT
+C(Z=9)	:$NUM=$NUM NINE
+E:
+
+*TWENTY
+C:Y=Z%10
+C:Z=Z-Y
+C(Z=20)	:$NUM=$NUM TWENTY
+C(Z=30)	:$NUM=$NUM THIRTY
+C(Z=40)	:$NUM=$NUM FORTY
+C(Z=50)	:$NUM=$NUM FIFTY
+C(Z=60)	:$NUM=$NUM SIXTY
+C(Z=70)	:$NUM=$NUM SEVENTY
+C(Z=80)	:$NUM=$NUM EIGHTY
+C(Z=90)	:$NUM=$NUM NINETY
+C:Z=Y
+E(Z=0)	:
+J:*WRITNUM
+
+*HUND
+C	:Y=Z%100
+C	:Z=(Z-Y)/100
+U	:*UNITS
+C	:$NUM=$NUM HUNDRED
+C	:Z=Y
+E(Z=0)	:
+J	:*WRITNUM
+
+*THOU
+C	:X=Z%1000
+C	:Z=(Z-X)/1000
+U	:*WRITNUM
+C	:$NUM=$NUM THOUSAND
+C	:Z=X
+E(Z=0)	:
+J	:*WRITNUM

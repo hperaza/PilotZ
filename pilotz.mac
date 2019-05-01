@@ -1,0 +1,3347 @@
+;**********************************************************************;
+;                                                                      ;
+;   Z80 PILOT interpreter. Copyright (C) 2009-2019, Hector Peraza.     ;
+;                                                                      ;
+;   This program is free software; you can redistribute it and/or      ;
+;   modify it under the terms of the GNU General Public License as     ;
+;   published by the Free Software Foundation; either version 2 of     ;
+;   the License, or (at your option) any later version.                ;
+;                                                                      ;
+;   This program is distributed in the hope that it will be useful,    ;
+;   but WITHOUT ANY WARRANTY; without even the implied warranty of     ;
+;   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      ;
+;   GNU General Public License for more details.                       ;
+;                                                                      ;
+;   You should have received a copy of the GNU General Public License  ;
+;   along with this program; if not, write to the Free Software        ;
+;   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.          ;
+;                                                                      ;
+;**********************************************************************;
+
+	.z80
+
+wboot	equ	0
+bdos	equ	5
+cpmfcb	equ	5Ch
+cpmbuf	equ	80h
+
+tab	equ	09h
+cr	equ	0Dh
+lf	equ	0Ah
+esc	equ	1Bh
+
+s$null	equ	0	; symbol types used in expression eval
+s$val	equ	1
+s$op	equ	2
+s$cond	equ	3
+s$err	equ	4
+
+cnd$eq	equ	1	; conditional types
+cnd$ne	equ	2
+cnd$lt	equ	3
+cnd$le	equ	4
+cnd$gt	equ	5
+cnd$ge	equ	6
+
+max$u	equ	10	; max user subroutine stack depth
+max$in	equ	80	; max input line length
+
+debug	equ	0	; break via rst 7 with '$' command if set to 1
+
+;-----------------------------------------------------------------------
+
+start::	ld	sp,stack
+	ld	hl,(bdos+1)
+	ld	l,0
+	dec	hl
+	ld	(memtop),hl	; setup top of memory pointer
+	call	clrprg		; clear program and variables
+	ld	hl,cpmbuf
+	ld	a,(hl)		; get command line length
+	inc	hl
+	push	hl
+	call	addhla
+	ld	(hl),0		; add trailing zero
+	pop	hl
+	call	skipbl
+	or	a		; empty command line?
+	jr	z,st1		; run in interactive mode if yes
+	call	load		; else load program
+	ld	hl,0
+	ld	(ln),hl
+	xor	a
+	ld	(errflg),a	; clear error and break flags
+	ld	(brkflg),a
+	call	run2		;  run it from the beginning
+	jp	wboot		;   and exit back to system
+
+st1:	call	print
+	db	'Z80 PILOT V1.0',cr,lf,0
+
+; command loop
+
+mloop:	ld	hl,mloop
+	push	hl		; push return address
+	xor	a
+	ld	(errflg),a	; clear error and break flags
+	ld	(brkflg),a
+;	call	vtnorm		; alpha mode
+	call	print
+	db	cr,lf,':) ',0	; show prompt
+	call	getstr		; read line
+	ld	hl,lnbuf	; point to input buffer
+	call	skipbl		; skip any blanks
+	or	a		; empty line?
+	jr	z,mloop		; loop if yes
+	cp	'?'		; help?
+	jp	z,help		; display commands if yes
+	if	debug
+	cp	'$'
+	jp	z,38h
+	endif
+	ex	de,hl		; move line pointer to DE
+	ld	hl,cmdtbl	; get command table address into HL
+ec1:	ld	a,(hl)
+	or	a		; end of table?
+	jr	z,unkcmd	; jump if yes -> command not found
+	push	de		; remember start of user command
+ec2:	ld	a,(hl)
+	or	a		; end of command?
+	jr	z,execmd	; jump if yes -> we have a match
+	ld	a,(de)
+	call	ucase
+	cp	(hl)		; else compare characters
+	jr	nz,ec3		; jump if they don't match
+	inc	hl		; else
+	inc	de		;  bump pointers
+	jr	ec2		;   and go for more
+ec3:	pop	de		; restore line pointer
+ec4:	inc	hl
+	ld	a,(hl)		; find the end of command in table
+	or	a
+	jr	nz,ec4
+	inc	hl		; skip over null byte terminator
+	inc	hl		;  and routine address
+	inc	hl
+	jr	ec1		; try next command
+execmd:	pop	bc		; discard line pointer, command tail is in DE
+	inc	hl		; HL now points to routine address
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a
+	push	hl		; push routine address
+	ex	de,hl
+	call	skipbl		; HL now points to command argument
+	ret			; execute command
+
+unkcmd:	call	error
+	db	'Unrecognized command',0
+	ret
+
+cmdtbl:	db	'BYE',0		; exit to CP/M
+	dw	bye
+	db	'CONT',0	; continue after ^C break (run w/o clear vars)
+	dw	rjump
+	db	'DELETE',0	; delete lines
+	dw	delete
+	db	'DIR',0		; show disk directory
+	dw	dir
+	db	'EDIT',0	; edit line
+	dw	edit
+	db	'HELP',0	; show help
+	dw	help
+	db	'INSERT',0	; insert lines
+	dw	insert
+	db	'LIST',0	; list program
+	dw	list
+	db	'LOAD',0	; load program
+	dw	load
+	db	'MEM',0		; show available memory
+	dw	shmem
+	db	'NEW',0		; clear program and variables
+	dw	new
+	db	'RUN',0		; run program
+	dw	run
+	db	'SAVE',0	; save program
+	dw	save
+	db	'TRACE',0	; trace program execution
+	dw	trace
+	db	'VARS',0	; show variables
+	dw	vars
+	db	0
+
+; --- NEW: erase old program and switch to program input mode
+
+new:	call	clrprg		; clear program and variables
+	ld	hl,pgm		; point to start of program area
+nw1:	ld	(hl),0FFh	; set end of program marker
+	ld	(endp),hl
+	inc	hl
+	ld	(endv),hl	; need this for the 'avail?' routine
+	call	getpl		; get program line
+	ld	a,(errflg)
+	or	a
+	jr	nz,nw2		; quit if error
+	ld	a,(brkflg)
+	or	a
+	jr	nz,nw2		; or by ctrl-c
+	ld	hl,lnbuf
+	push	hl
+	call	strlen		; get string length
+	pop	hl
+	ld	b,0
+	push	bc
+	call	avail2		; check for enough memory (+len +null)
+	pop	bc
+	jr	c,errm
+	ld	de,(endp)
+	ld	a,c
+	ld	(de),a		; store length
+	inc	de
+	inc	bc		; include null byte
+	ldir			; store program line
+	ld	hl,(ln)
+	inc	hl		; increment line number
+	ld	(ln),hl
+	ld	(prgln),hl	; and program line count
+	ex	de,hl
+	jr	nw1		; go for more
+nw2:	jp	clrvar		; return after clearing variables
+
+errm:	call	error
+	db	'Program too big',0
+	ret
+
+; --- EDIT n: edit (replace) the specified line
+
+edit:	call	getarg
+	ld	a,(errflg)
+	or	a
+	ret	nz
+	ld	bc,(begln)
+	call	findln
+	ret	c
+	push	hl
+	ld	hl,(begln)
+	ld	(ln),hl
+	inc	hl
+	ld	a,' '
+	ld	(dfill),a
+	call	uhldec
+	ld	a,' '
+	call	typea
+	pop	hl
+	inc	hl
+	call	putstr
+	call	crlf
+	call	getpl
+	ld	a,(errflg)
+	or	a
+	jr	nz,ed3
+	ld	a,(brkflg)
+	or	a
+	ret	nz
+	ld	bc,(ln)
+	call	findln
+	jr	c,ed3		; should not happen
+	ex	de,hl		; get old line address into DE
+	ld	hl,lnbuf
+	call	strlen
+	ld	a,(de)		; get old length
+	sub	c		; compare with new
+	push	de		; push old line address
+	push	bc		; push new length
+	jr	z,ed2		; if same length, just copy the new line
+	jr	c,ed1		; jump if new line is longer
+
+	; move down
+
+	ld	b,0
+	inc	bc
+	inc	bc		; new length in BC
+	ld	l,e
+	ld	h,d
+	add	hl,bc
+	ex	de,hl		; DE = dst
+	ld	c,(hl)
+	ld	b,0
+	inc	bc
+	inc	bc		; old length in BC
+	add	hl,bc		; HL = src
+	push	hl
+	ld	c,l
+	ld	b,h		; start of next line in BC
+	ld	hl,(endp)
+	or	a
+	sbc	hl,bc
+	inc	hl
+	ld	c,l
+	ld	b,h		; amount to move in BC
+	pop	hl
+	ldir
+	dec	de
+	ld	(endp),de	; set new endp
+	jr	ed2
+
+ed1:	; move up
+
+	ex	de,hl
+	ld	e,(hl)
+	ld	d,0
+	inc	de
+	inc	de		; old length in DE
+	add	hl,de
+	ex	de,hl		; start of next line in DE
+	ld	hl,(endp)
+	or	a
+	sbc	hl,de
+	inc	hl
+	ld	c,l
+	ld	b,h		; amount to move in BC
+	cpl
+	inc	a
+	ld	l,a
+	ld	h,0		; length diff in HL
+	call	ed4		; check for enough memory
+	ld	de,(endp)
+	add	hl,de
+	ld	(endp),hl	; set new endp
+	ex	de,hl		; src in HL, dst in DE
+	lddr
+
+ed2:	pop	bc		; pop new length
+	pop	de		; pop old line address
+	ld	a,c
+	ld	(de),a		; store new length
+	inc	de		; advance pointer
+	inc	bc		; include null terminator
+	ld	hl,lnbuf
+	ldir			; copy string
+ed3:	jp	clrvar		; clear variables and return
+
+ed4:	push	bc
+	ld	c,a
+	ld	b,0
+	call	avail?
+	pop	bc
+	ret	nc
+	pop	bc
+	pop	bc
+	pop	bc		; return one level higher
+	jp	errm
+
+; --- INSERT n: insert new line(s) at the specified location
+
+insert:	ld	a,1
+	ld	(errflg),a	; kludge!
+	call	getarg
+	ld	a,(errflg)
+	or	a
+	ret	nz
+	call	clrvar		; clear variables and dynamic area
+	ld	hl,(begln)
+	ld	(ln),hl
+	ld	de,(prgln)
+	call	hl?de
+	jp	c,noln
+ins1:	call	getpl
+	ld	a,(errflg)
+	or	a
+	jr	nz,ins2		; end if error
+	ld	a,(brkflg)
+	or	a
+	jr	nz,ins2		; or ctrl-c
+	ld	bc,(ln)
+	call	findln
+	jr	c,ins2
+	ex	de,hl
+	ld	hl,lnbuf
+	call	strlen
+	ld	b,0
+	push	bc
+	call	avail2		; check for enough memory (+len +null)
+	pop	bc
+	jp	c,errm
+	ld	hl,(endp)
+	sbc	hl,de		; xfer length = endp-lnptr+1 (note CY was 0)
+	inc	hl
+	push	bc		; push length of new line
+	push	de		; push line pointer
+	push	hl		; push xfer length
+	ld	l,c
+	ld	h,b		; get new line length into HL
+	inc	hl		; +len byte
+	inc	hl		; +null byte = total length
+	ld	de,(endp)
+	add	hl,de		; advance end pointer by that amount
+	ld	(endp),hl
+	inc	hl
+	ld	(endv),hl	; set endv, required by 'avail?'
+	dec	hl
+	ex	de,hl		; src in HL (endp), dst in DE (endp+len+2)
+	pop	bc		; xfer length in BC
+	lddr
+	pop	de		; pop line pointer
+	pop	bc		; pop new line length
+	ld	hl,lnbuf
+	ld	a,c
+	ld	(de),a		; store length
+	inc	de
+	ld	b,0
+	inc	bc		; include trailing zero
+	ldir			; copy line
+	ld	hl,(ln)
+	inc	hl
+	ld	(ln),hl
+	ld	hl,(prgln)
+	inc	hl
+	ld	(prgln),hl
+	jr	ins1
+ins2:	jp	clrvar		; clear variables and return
+
+; --- DELETE [n1]-[n2]: delete line(s)
+
+delete:	call	getarg
+	ld	a,(errflg)
+	or	a
+	ret	nz
+	ld	bc,(endln)
+	ld	a,b
+	or	c
+	jr	nz,del1
+	ld	bc,(begln)
+	inc	bc
+	ld	(endln),bc
+del1:	call	findln		; find last line to delete
+;;	ret	c
+	push	hl
+	ld	bc,(begln)
+	call	findln		; find first line to delete
+	pop	de		; HL = start addr, DE = end addr + 1
+	ret	c
+	push	hl
+	ld	hl,(endp)
+	inc	hl
+	or	a
+	sbc	hl,de		; bytes to move = endp - end of last line
+	ld	c,l
+	ld	b,h
+	pop	hl
+	ex	de,hl
+	ldir			; delete lines
+	dec	de
+	ld	(endp),de	; set new endp
+	ld	hl,(endln)
+	ld	de,(begln)
+	or	a
+	sbc	hl,de
+	ex	de,hl
+	ld	hl,(prgln)	; update program line count
+	sbc	hl,de
+	ld	(prgln),hl
+	jp	clrvar		; clear variables and return
+
+; --- LIST [n1]-[n2]: list program line(s)
+
+list:	ld	a,(hl)
+	or	a
+	jr	nz,lst1
+	ld	hl,0
+	ld	(begln),hl
+	ld	hl,(prgln)
+	ld	(endln),hl
+	jr	lst2
+lst1:	call	getarg		; get arg line numbers
+	ld	a,(errflg)
+	or	a
+	ret	nz
+	ld	de,(begln)
+	ld	hl,(endln)
+	call	hl?de		; endln <= begln?
+	jr	c,lst2
+	inc	de
+	ld	(endln),de	; if yes -> endln = begln + 1
+lst2:	ld	bc,(begln)
+	call	findln		; find starting line
+	ret	c		; return if not found
+	ld	c,l
+	ld	b,h
+	ld	de,(begln)
+	ld	hl,(endln)
+lst21:	call	hl?de
+	ret	nc
+	ex	de,hl
+	ld	a,' '
+	ld	(dfill),a
+	inc	hl
+	call	uhldec		; display line number
+	dec	hl
+	ld	a,' '
+	call	typea		; followed by a space
+	ex	de,hl
+	inc	bc
+lst22:	ld	a,(bc)		; followed by the program text
+	inc	bc
+	or	a
+	jr	z,lst23
+	call	typea
+	jr	lst22
+lst23:	call	crlf		; output cr/lf
+	call	chkey
+	or	a
+	jr	z,lst25
+	call	getc
+	cp	3		; ctrl-c?
+	jp	z,pctlc		; interrupt list if yes
+	cp	13h		; ctrl-s?
+	jr	nz,lst25
+lst24:	call	getc
+	cp	11h		; wait for ctrl-q then
+	jr	nz,lst24
+lst25:	inc	de
+	jr	lst21		; else loop
+
+; --- SAVE filename: save program to a disk file
+
+save:	ld	de,(prgln)
+	ld	a,d
+	or	e		; no program in memory?
+	jp	z,noprg		; then abort with error
+	ld	a,(hl)
+	or	a
+	jr	z,nofn		; filename must be specified
+	ld	de,cpmfcb
+	call	mkfcb		; create FCB
+	call	addext		; add .PLT extension if necessary
+	call	chkfwc		; wildcard used?
+	jr	z,badfn		; complain if yes
+	call	fcreat		; create the file, make backup of the old one
+	jr	c,crerr
+	ld	hl,pgm		; point to start of program
+sav1:	ld	a,(hl)		; get length byte
+	inc	hl
+	inc	a		; end of program?
+	jr	z,sav4		; jump if yes
+sav2:	ld	a,(hl)		; get character
+	inc	hl
+	or	a		; end of line?
+	jr	z,sav3		; exit this loop if yes
+	call	fputc		; else write character to file
+	jr	c,sverr
+	jr	sav2		; and loop for more
+sav3:	ld	a,cr		; write CR/LF to file
+	call	fputc
+	jr	c,sverr
+	ld	a,lf
+	call	fputc
+	jr	c,sverr
+	jr	sav1		; loop
+sav4:	call	fwreof
+	jr	c,sverr
+	call	fclose
+	jr	c,sve1
+	ret
+
+nofn:	call	error
+	db	'No file name',0
+	ret
+
+badfn:	call	error
+	db	'Invalid file name',0
+	ret
+
+crerr:	call	error
+	db	'Directory full',0
+	ret
+
+sverr:	call	fclose
+sve1:	call	error
+	db	'Disk full',0
+	ret
+
+; --- LOAD filename: load program from disk
+
+load:	ld	de,cpmfcb
+	call	mkfcb
+	call	addext		; if no extension supplied, use .PLT
+	call	chkfwc		; any wildcards used?
+	jr	z,badfn		; complain if yes
+	call	fopen		; else open the file
+	jr	c,fnf		; give error if not found
+	call	clrprg		; clear program and variables
+	ld	hl,pgm		; point to start of program area
+ld1:	ld	(hl),0FFh	; set end of program marker
+	ld	(endp),hl
+	inc	hl		; and end of variables
+	ld	(endv),hl	;  as required by 'avail?'
+	call	fgetpl		; read line from file
+	jr	c,longln	; quit if line too long
+	ld	a,(errflg)
+	or	a
+	jr	nz,rderr	; or if error
+	ld	a,(brkflg)
+	or	a
+	jr	nz,ld2		; or end of file
+	ld	hl,lnbuf
+	push	hl
+	call	strlen		; get string length
+	pop	hl
+	ld	b,0
+	push	bc
+	call	avail2		; check for enough memory (+2 = +len +null)
+	pop	bc
+	jp	c,errm
+	ld	de,(endp)
+	ld	a,c
+	ld	(de),a		; store length
+	inc	de
+	inc	bc		; include null byte
+	ldir			; store program line
+	ld	hl,(ln)
+	inc	hl		; increment line number
+	ld	(ln),hl
+	ld	(prgln),hl	; and program line count
+	ex	de,hl
+	jr	ld1		; go for more
+ld2:	call	fclose
+ld3:	ld	hl,(ln)
+	ld	(prgln),hl
+	jp	clrvar		; clear variables and return
+
+fnf:	call	error
+	db	'File not found',0
+	jr	ld3
+
+longln:	call	error
+	db	'Line too long',0
+	jr	ld2
+
+rderr:	call	error
+	db	'File read error',0
+	jr	ld2
+
+; --- TRACE [n]: trace program
+
+trace:	ld	a,1
+	jr	run0
+
+; --- RUN [n]: execute program
+
+run:	xor	a
+run0:	ld	(trflg),a
+	ld	a,(hl)
+	or	a
+	jr	nz,run1
+	ld	hl,(prgln)
+	ld	a,h
+	or	l
+	jr	z,run1
+	ld	hl,0
+	ld	(ln),hl
+	jr	run2
+run1:	call	getarg
+	ld	a,(errflg)
+	or	a
+	ret	nz
+	ld	hl,(begln)
+	ld	(ln),hl
+run2:	call	exec		; execute program
+	ret
+
+; --- VARS: show variables
+
+vars:	ld	a,(hl)
+	cp	'%'		; also show special vars?
+	jr	nz,v03		; jump if not
+	ld	hl,spvars
+v0:	ld	a,(hl)
+	inc	a		; end of table?
+	jr	z,v03		; exit loop if yes
+	dec	a
+	push	af		; save variable type
+	inc	hl
+	ld	a,'%'
+	call	typea
+	call	putstr		; display system variable name
+	call	print
+	db	' = ',0
+	push	hl
+	call	gtxv
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a
+	pop	de
+	pop	af		; pop variable type
+	rla
+	jr	c,v01		; branch if numeric
+	call	putstr		; display value
+	jr	v02
+v01:	xor	a
+	ld	(dfill),a
+	call	hldec		; display value as signed decimal
+v02:	call	crlf
+	ex	de,hl
+	inc	hl
+	inc	hl
+	jr	v0
+v03:	ld	hl,(endp)
+	inc	hl		; get start of variable area into HL
+v1:	ld	a,(hl)
+	inc	a		; end of variables?
+	ret	z		; return if yes
+	dec	a
+	rla			; get variable type into carry bit
+	push	af		;  and save it
+	ld	a,'#'
+	jr	c,v2
+	ld	a,'$'
+v2:	call	typea		; show variable type
+	inc	hl
+	call	putstr		; display variable name
+	call	print
+	db	' = ',0
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)		; get value into DE
+	inc	hl
+	pop	af		; restore variable type
+	jr	c,vnum		; branch if numeric
+	ex	de,hl
+	call	putstr		; display the value
+	ex	de,hl
+	call	crlf
+	jr	v1
+vnum:	xor	a
+	ld	(dfill),a
+	ex	de,hl
+	call	hldec		; display value as signed decimal
+	ex	de,hl
+	call	crlf
+	jr	v1
+
+; --- MEM: show memory usage
+
+shmem:	ld	hl,(prgln)
+	ld	a,' '
+	ld	(dfill),a
+	call	uhldec
+	call	print
+	db	' program line(s)',cr,lf,0
+	ld	hl,(endp)
+	ld	de,pgm
+	or	a
+	sbc	hl,de
+	call	uhldec
+	call	print
+	db	' byte(s) used by program',cr,lf,0
+	ld	hl,(memtop)
+	ld	de,(bgns)
+	or	a
+	sbc	hl,de
+	ld	de,(endv)
+	add	hl,de
+	ld	de,(endp)
+	or	a
+	sbc	hl,de
+	dec	hl
+	call	uhldec
+	call	print
+	db	' byte(s) used by variables',cr,lf,0
+	ld	hl,(bgns)
+	ld	de,(endv)
+	or	a
+	sbc	hl,de
+	dec	hl
+	call	uhldec
+	call	print
+	db	' byte(s) free',cr,lf,0
+	ret
+
+; --- DIR filespec: show disk directory
+
+dir:	ld	de,cpmfcb
+	call	mkfcb		; make fcb from command tail (if any)
+	call	efcb?		; empty FCB?
+	call	z,inifcb	; if yes, default to *.*
+	call	crlf
+	call	fndfst
+	ret	z
+	ld	e,5
+dir2:	dec	a
+	and	3
+	rlc	a
+	rlc	a
+	rlc	a
+	rlc	a
+	rlc	a
+	ld	hl,cpmbuf
+	call	addhla
+	inc	hl
+	call	prntfn
+	dec	e
+	jr	nz,dir3
+	call	crlf
+	ld	e,5
+	jr	dir4
+dir3:	call	print
+	db	'   ',0
+dir4:	call	fndnxt
+	jr	nz,dir2
+	ld	a,e
+	cp	5
+	call	nz,crlf
+	ret
+
+inifcb:	ld	hl,cpmfcb+1
+	ld	b,8+3
+dir1:	ld	(hl),'?'	; init fcb
+	inc	hl
+	djnz	dir1
+	ld	(hl),0
+	inc	hl
+	ld	(hl),0
+	inc	hl
+	ld	(hl),0
+	ret
+
+; --- BYE: exit to CP/M
+
+bye:	jp	wboot
+
+; --- HELP: show available commands, also invoked with '?'
+
+help:	call	print
+	db	'Available commands:',cr,lf,0
+	ld	hl,cmdtbl
+hlp1:	call	crlf
+	ld	b,7
+hlp2:	ld	c,9
+	call	putc
+	call	putstr
+	inc	hl
+	inc	hl
+	ld	a,(hl)
+	or	a
+	jr	z,crlf
+	djnz	hlp2
+	jr	hlp1
+
+;-----------------------------------------------------------------------
+
+; Display error message. HL = message.
+
+error:	ex	(sp),hl
+	call	perror
+	ex	(sp),hl
+crlf:	ld	a,cr
+	call	typea
+	ld	a,lf
+	call	typea
+	ret
+
+; Display 'break' message
+
+brkln:	call	print
+	db	'Break',0
+	ld	a,1
+	ld	(brkflg),a
+	jr	atln
+errln:	ex	(sp),hl
+	call	perror
+	ex	(sp),hl
+atln:	call	print
+	db	' at line ',0
+	xor	a
+	ld	(dfill),a
+	ld	hl,(ln)
+	inc	hl
+	call	uhldec
+	jr	crlf
+
+perror:	ld	c,'?'
+	call	putc
+	jr	putstr
+
+; Print string following call
+
+print:	ex	(sp),hl
+	call	putstr
+	ex	(sp),hl
+	ret
+
+; Print string pointed to by HL
+
+putstr:	ld	a,(hl)
+	inc	hl
+	or	a
+	ret	z
+	call	typea
+	jr	putstr
+
+; Print string pointed to by HL, expanding '\' sequences
+
+putstx:	ld	a,(hl)
+	cp	'\'
+	call	z,escchr
+	inc	hl
+	or	a
+	ret	z
+	call	typea
+	jr	putstx
+
+; Process '\' escape character from a string
+
+escchr:	inc	hl
+	ld	a,(hl)
+	or	a		; end of string?
+	ret	z		; return if yes
+	push	bc
+	ld	bc,esc1
+	push	bc		; push return address to routine exit
+	cp	'n'
+	ld	c,lf
+	ret	z
+	cp	'r'
+	ld	c,cr
+	ret	z
+	cp	't'
+	ld	c,tab
+	ret	z
+	cp	'e'
+	ld	c,esc
+	ret	z
+	cp	'a'
+	ld	c,07h		; bell
+	ret	z
+	cp	'b'
+	ld	c,08h		; backspace
+	ret	z
+	pop	bc
+	pop	bc
+	or	a
+	ret
+esc1:	ld	a,c
+	pop	bc
+	or	a		; clear Z flag
+	ret
+
+; Print HL as signed decimal number
+
+hldec:	ld	a,h
+	or	a
+	jp	p,uhldec
+	ld	a,'-'
+	call	typea
+	call	hlneg
+	jr	uhldec
+
+; Print HL as unsigned decimal number
+
+uhldec:	push	hl
+	push	de
+	push	bc
+	ld	b,0
+	ld	de,-10000
+	call	sbcnt
+	ld	de,-1000
+	call	sbcnt
+	ld	de,-100
+	call	sbcnt
+	ld	de,-10
+	call	sbcnt
+	ld	a,l
+	add	a,'0'
+	call	typea
+	pop	bc
+	pop	de
+	pop	hl
+	ret
+
+sbcnt:	ld	c,'0'-1
+sb1:	inc	c
+	add	hl,de
+	jr	c,sb1
+	sbc	hl,de
+	inc	b
+	dec	b
+	jp	nz,putc
+	inc	b
+	ld	a,c
+	cp	'0'
+	jp	nz,typea
+	dec	b
+	ld	a,(dfill)
+	or	a
+	jp	nz,typea
+	ret
+
+; HL = -HL
+
+hlneg:	ld	a,h
+	cpl
+	ld	h,a
+	ld	a,l
+	cpl
+	ld	l,a
+	inc	hl
+	ret
+
+; Convert ASCII number.
+; On input DE points to string.
+; On output HL contains the converted value and DE points to the first
+; non-digit character.
+
+atoi:	ld	hl,0
+	ld	a,(de)
+	cp	'+'
+	jr	z,atoi0
+	cp	'-'
+	jr	nz,atoi1
+	push	hl
+	ld	hl,hlneg
+	ex	(sp),hl		; negate HL before return
+atoi0:	inc	de
+atoi1:	ld	a,(de)
+	call	isdig
+	ret	c
+	sub	'0'
+	push	de
+	add	hl,hl
+	ld	e,l
+	ld	d,h
+	add	hl,hl
+	add	hl,hl
+	add	hl,de		; *10
+	ld	e,a
+	ld	d,0
+	add	hl,de
+	pop	de
+	inc	de
+	jr	atoi1
+
+; Convert char in A to uppercase
+
+ucase:	cp	'a'
+	ret	c
+	cp	'z'+1
+	ret	nc
+	and	5Fh
+	ret
+
+; Check for digit, returns CY clear on success
+
+isdig:	cp	'0'
+	ret	c
+	cp	'9'+1
+	ccf
+	ret
+
+; Check for letter, returns CY clear on success
+
+isletr:	cp	'A'
+	ret	c
+	cp	'Z'+1
+	ccf
+	ret	nc
+	cp	'a'
+	ret	c
+	cp	'z'+1
+	ccf
+	ret
+
+; Check for valid variable name character, returns CY set on bad character.
+
+isvok:	call	isletr
+	ret	nc
+	call	isdig
+	ret	nc
+	cp	'?'
+	ret	z
+	cp	'_'
+	ret	z
+	cp	'@'
+	ret	z
+	scf
+	ret
+
+; Search substring (DE) in (HL), ignoring case and using a sliding-string
+; algorithm. Returns CY clear on success.
+
+match:	push	hl
+	push	de
+m2:	ld	a,(de)
+	or	a		; end of substring?
+	jr	z,m3		; yes, match found
+	call	ucase
+	ld	c,a
+	ld	a,(hl)
+	call	ucase
+	cp	c		; compare characters
+	inc	hl
+	inc	de
+	jr	z,m2		; loop if they match
+	or	a		; return if end of searched string
+	scf			; CY means no match found
+m3:	pop	de
+	pop	hl
+	ret	z		; return match/no match
+	inc	hl		; else restart match from
+	jr	match		;  the next character of searched string
+
+; Compare strings in (HL) and (DE).
+
+strcmp:	ld	a,(de)
+	cp	(hl)
+	ret	nz
+	or	a
+	ret	z
+	inc	hl
+	inc	de
+	jr	strcmp
+
+; Compare strings in (HL) and (DE), ignores case
+
+stccmp:	ld	a,(hl)
+	call	ucase
+	ld	c,a
+	ld	a,(de)
+	call	ucase
+	cp	c
+	ret	nz
+	or	a
+	ret	z
+	inc	hl
+	inc	de
+	jr	stccmp
+
+; Return length of (HL) string in C.
+
+strlen:	ld	c,0
+strl1:	ld	a,(hl)
+	or	a
+	ret	z
+	inc	hl
+	inc	c
+	jr	strl1
+
+; Skip blanks, HL points to text.
+
+skip0:	inc	hl
+skipbl:	ld	a,(hl)
+	cp	' '
+	jr	z,skip0
+	cp	tab
+	jr	z,skip0
+	ret
+
+; Check for available memory, BC = requested space.
+; If no space is available, garbage collection will be attempted.
+; Returns CY if not enough memory.
+; avail2 and avail4 are convenience entry points, they add 2 and 4 to BC
+; respectively before check.
+
+avail4:	inc	bc
+	inc	bc
+avail2:	inc	bc
+	inc	bc
+avail?:	push	hl
+	push	de
+	ld	hl,(endv)
+	add	hl,bc
+	inc	hl
+	ld	de,(bgns)
+	call	hl?de		; returns CY if endv + space >= bgns
+	jr	nc,av1
+	push	hl
+	push	bc
+	call	gbcol		; try garbage collecting
+	pop	bc
+	pop	hl
+	ld	de,(bgns)
+	call	hl?de
+av1:	pop	de
+	pop	hl
+	ret
+
+; Compare HL and DE. Returns CY if HL > DE and Z if HL == DE
+
+hl?de:	ld	a,d
+	cp	h
+	ret	nz
+	ld	a,e
+	cp	l
+	ret
+
+; HL = HL + A
+
+addhla:	add	a,l
+	ld	l,a
+	ret	nc
+	inc	h
+	ret
+
+; Get a string from console into lnbuf.
+
+getstr:	ld	hl,lnbuf
+	ld	(hl),0
+	ld	b,0
+gs1:	call	getc
+	cp	3		; ^C aborts input
+	jr	z,ctlc
+	cp	cr		; CR ends line
+	jr	z,gsend
+	cp	8		; ^H backspaces
+	jr	z,bkspc
+	cp	7Fh		; and so does DEL
+	jr	z,bkspc
+	cp	tab		; tab inserts spaces (not tabs)
+	jr	z,tabc
+	jr	c,gs1		; other control chars are simply ignored
+gs2:	ld	c,a
+	ld	a,b
+	cp	max$in-1
+	jr	nc,gs1
+	ld	(hl),c
+	call	putc
+	inc	hl
+	inc	b
+	jr	gs1
+
+bkspc:	inc	b
+	dec	b
+	jr	z,gs1
+	dec	hl
+	dec	b
+	call	print
+	db	8,' ',8,0
+	jr	gs1
+
+tabc:	ld	a,b
+	add	a,8
+	and	0F8h
+	cp	max$in-1
+	jr	nc,gs1
+	sub	b
+tab1:	ld	c,' '
+	ld	(hl),c
+	push	af
+	call	putc
+	pop	af
+	inc	b
+	dec	a
+	jr	nz,tab1
+	jr	gs1
+
+ctlc:	xor	a
+	ld	(lnbuf),a
+	inc	a
+	ld	(brkflg),a
+pctlc:	call	print
+	db	'^C',cr,lf,0
+	ret
+
+gsend:	ld	(hl),0
+	call	crlf
+	ret
+  
+; Read program line from console.
+
+getpl:	ld	a,' '
+	ld	(dfill),a
+	ld	hl,(ln)
+	inc	hl
+	call	uhldec
+	ld	c,' '
+	call	putc
+	call	getstr
+	ret
+
+; Read program line from file.
+
+fgetpl:	ld	hl,lnbuf
+	ld	b,0
+fgp1:	call	fgetc
+	jr	c,fgp2
+	cp	1Ah
+	jr	z,fgp2
+	cp	lf
+	jr	z,fgp3
+	cp	cr
+	jr	z,fgp1
+	ld	(hl),a
+	inc	hl
+	ld	a,max$in-1
+	cp	b
+	jr	nc,fgp1
+	ret
+fgp2:	ld	a,1
+	ld	(brkflg),a
+	or	a
+	ret
+fgp3:	ld	(hl),0
+	ret
+
+;-----------------------------------------------------------------------
+
+; Find line whose number is in BC, return address in HL.
+; If line not found, return CY (and HL pointing to end of prog)
+
+findln:	ld	hl,pgm
+fln1:	ld	a,b
+	or	c
+	ret	z		; found
+	ld	a,(hl)		; get length
+	inc	a		; end of program (0FFh)? +length byte
+	scf
+	ret	z		; not found
+	inc	a		; +null terminator
+	call	addhla		; point to next line
+	dec	bc
+	jr	fln1
+
+; Find line with specified label in DE.
+; Returns line number in BC, or CY if not found.
+
+fndlbl:	ld	hl,pgm
+	ld	bc,0
+flb1:	ld	a,(hl)		; get length
+	inc	a		; end of program (0FFh)? +length byte
+	scf
+	ret	z		; not found
+	push	hl
+	inc	hl
+	call	skipbl
+	cp	'*'
+	jr	nz,flb2
+	inc	hl
+	push	de
+	push	bc
+	call	stccmp
+	ld	a,(hl)
+	pop	bc
+	pop	de
+	pop	hl
+	ret	z
+	cp	' '
+	ret	z
+	cp	tab
+	ret	z
+	jr	flb3
+flb2:	pop	hl
+flb3:	ld	a,(hl)
+	inc	a		; length
+	inc	a		; +null terminator
+	call	addhla		; point to next line
+	inc	bc
+	jr	flb1
+
+; Get and validate line numbers
+
+getarg:	ex	de,hl		; get ptr to command tail into DE
+	ld	hl,(prgln)
+	ld	a,h
+	or	l
+	jp	z,noprg		; error if no program in memory
+	push	de
+gta1:	ld	a,(de)		; get command char
+	or	a		; end of command?
+	jr	z,gta11		; jump if yes
+	inc	de		; advance ptr
+	call	isdig		; digit?
+	jr	nc,gta1		; loop if yes
+	cp	'-'		; delimiter?
+	scf
+	jr	z,gta1		; loop if yes
+gta11:	pop	de
+	jr	c,nolnum	; error if not a digit or allowed delimiter
+	ld	a,(de)
+	cp	'-'
+	jr	nz,gta2
+	ld	hl,1
+	jr	gta3
+gta2:	call	atoi
+gta3:	call	valid
+	ret	c
+	ld	(begln),hl
+	ld	a,(de)
+	cp	'-'
+	jr	z,gta4
+	ld	hl,0
+	jr	gta6
+gta4:	inc	de
+	ld	a,(de)
+	or	a
+	jr	nz,gta5
+	ld	hl,(prgln)
+	jr	gta6
+gta5:	call	atoi
+	call	valid		; endln in HL
+	ret	c
+	ld	de,(begln)
+	ex	de,hl
+	call	hl?de		; begln > endln?
+	ex	de,hl
+	jr	c,noascn	; error if yes
+gta6:	ld	(endln),hl
+	ld	hl,(begln)
+	dec	hl
+	ld	(begln),hl
+	ret
+
+noprg:	call	error
+	db	'No program',0
+	ld	a,1
+	ld	(errflg),a
+	ret
+
+nolnum:	call	error
+	db	'Invalid digit or delimiter in argument',0
+	ld	a,1
+	ld	(errflg),a
+	ret
+
+noascn:	call	error
+	db	'Line numbers must be in ascending order',0
+	ld	a,1
+	ld	(errflg),a
+	ret
+
+; Validate line number in HL, returns CY on error.
+
+valid:	ld	a,h
+	or	l
+	jr	z,noln
+	ld	a,(errflg)
+	or	a
+	jr	nz,va1		; INSERT kludge to allow line# = latest+1
+	push	de
+	ld	de,(prgln)
+	call	hl?de		; line# > prgln?
+	pop	de
+	jr	c,noln
+va1:	xor	a
+	ld	(errflg),a
+	ret
+
+noln:	call	error
+	db	'No such line',0
+	ld	a,1
+	ld	(errflg),a
+	scf
+	ret
+
+; Clear program and variables
+
+clrprg:	ld	hl,0
+	ld	(ln),hl		; clear current line
+	ld	(prgln),hl	;  and program line count
+	ld	hl,pgm
+	ld	(hl),0FFh	; 0FFh is end of program marker
+	ld	(endp),hl	; set end pointer
+
+	; fall thru
+
+; Clear variables
+
+clrvar:	ld	hl,(endp)
+	inc	hl
+	ld	(hl),0FFh	; 0FFh is end of variables
+	ld	(endv),hl
+	ld	hl,(memtop)
+	ld	(hl),0FFh	; clear also the dynamic string storage
+	ld	(bgns),hl
+	xor	a
+	ld	(answer),a
+	ret
+
+; Extract variable name from a string, returns CY on error.
+; On input HL points to string. Stores the variable name in vname.
+; Returns with HL pointing to first invalid char.
+
+evname:	ld	de,vname
+ename:	ld	b,12		; B = max length
+	ld	a,(hl)
+	call	isletr		; first char must be a letter
+	ret	c
+evn1:	call	ucase
+	ld	(de),a
+	inc	hl
+	inc	de
+	dec	b
+	jr	z,env4
+	ld	a,(hl)
+	call	isvok
+	jr	nc,evn1
+evn2:	xor	a
+	ld	(de),a
+	ret
+evn3:	inc	hl
+env4:	ld	a,(hl)		; ignore all extra chars on name
+	call	isvok
+	jr	c,evn2
+	jr	evn3
+
+; Find variable, name is in (DE), type in C (00h = string, 80h = numeric),
+; mode in B (00h = search user variables, 01h = search system variables)
+; If found, return pointer to value in HL.
+; Otherwise, return CY and HL pointing to end of var area.
+
+fndvar:	dec	b
+	jr	z,fvs
+	ld	hl,(endp)
+	inc	hl		; point to start of variables
+fv1:	ld	a,(hl)		; get length and type
+	inc	a		; end of variables?
+	scf
+	ret	z		; return if yes -> variable not found
+	dec	a
+	xor	c		; same type?
+	rla
+	jr	c,fv2		; jump if not
+	push	hl
+	inc	hl		; skip length byte
+	push	de
+	call	strcmp		; compare names
+	pop	de
+	jr	z,fv3		; jump if equal -> variable found
+	pop	hl
+fv2:	ld	a,(hl)
+	and	7Fh
+	inc	hl		; skip over length,
+	inc	hl		;  null terminator
+	inc	hl		;   and value
+	inc	hl
+	call	addhla		; point to next variable
+	jr	fv1
+fv3:	pop	bc		; discard saved HL
+	inc	hl		; skip null terminator, point to value
+	ret			; and return
+
+fvs:	ld	hl,spvars
+	call	fv1		; search system variables
+	ret	c		; return if not found
+gtxv:	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a		; get routine address into HL
+	jp	(hl)		; exec routine
+
+spvars:	db	6,'ANSWER',0
+	dw	sva
+	db	7+80h,'MATCHED',0
+	dw	svm
+	db	7+80h,'MAXUSES',0
+	dw	svu
+	db	8+80h,'USELEVEL',0
+	dw	svl
+	db	0FFh
+
+; string system variables
+
+sva:	ld	hl,ansadr
+	ret			; note CY is clear from above
+
+ansadr:	dw	answer
+
+; numeric system variables
+
+svm:	ld	hl,mtchd
+	ret			; CY is clear from above
+
+svu:	ld	hl,maxadr
+	ret			; CY is clear from above
+
+maxadr:	dw	max$u
+
+svl:	ld	hl,usp
+	ret			; CY is clear from above
+
+; Set/add string variable.
+; DE = var name, dsptr = value (already allocated string if dynamic)
+; We can't pass the address of the string in HL, since the call to
+; 'avail?' may cause the garbage collection routine to be called,
+; which in turn rearranges memory and HL might no longer point to
+; the right place. Since 'dsptr' is pointed to by the block just
+; allocated, its value will be updated during garbage collection.
+; Returns CY on error (no more space).
+
+setsv:	ld	c,0		; var type = string
+	ld	b,c		; lookup user variables
+	call	fndvar
+	jr	nc,sv1		; jump if found
+	ex	de,hl		; else create a new one
+	push	hl
+	call	strlen		; obtain length of name
+	ld	b,0
+	push	bc
+	call	avail4		; enough memory? (+4 extra)
+	pop	bc
+	pop	hl
+	jr	c,sv2		; jump if not
+	ld	de,(endv)
+	ld	a,c		; get length
+	ld	(de),a		; store it
+	inc	de
+	inc	bc		; include null byte
+	ldir			; store name
+	ex	de,hl
+	ld	(hl),0		; init value field
+	inc	hl		; see check for dynamic allocation below
+	ld	(hl),0
+	inc	hl
+	ld	(hl),0FFh	; set new end of variables
+	ld	(endv),hl
+	dec	hl
+	dec	hl
+sv1:	ld	de,(dsptr)
+	ld	c,(hl)
+	ld	(hl),e
+	inc	hl
+	ld	b,(hl)		; get old value into BC
+	ld	(hl),d		;  and store new value
+	push	hl
+	ld	hl,(bgns)
+	call	hl?de		; dynamically allocated string?
+	pop	hl
+	ccf
+	ret	nc		; return if not
+	dec	hl		; else link string to this var
+	ex	de,hl
+	dec	hl
+	ld	(hl),d
+	dec	hl
+	ld	(hl),e
+	ld	e,c		; check old string
+	ld	d,b
+	ld	hl,(bgns)
+	call	hl?de		; was it dynamically allocated?
+	ccf
+	ret	nc		; return if not
+	ex	de,hl
+	dec	hl
+	ld	(hl),0		; else free the space
+	dec	hl
+	ld	(hl),0
+	or	a		; return with CY clear
+	ret
+
+sv2:	ld	de,(dsptr)
+	ld	hl,(bgns)
+	call	hl?de
+	jr	c,sv3
+	ex	de,hl		;;
+	dec	hl
+	ld	(hl),0		; free the dyn allocated string
+	dec	hl
+	ld	(hl),0
+sv3:	jp	nomem		; and return with error
+
+; Get string variable
+; DE = var name, returns HL = ptr to value string or CY if not found.
+; B = mode (0 = user vars, 1 = system vars)
+
+getsv:	ld	c,0		; type = string var
+	call	fndvar
+	ret	c
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a		; get value into HL
+	or	a		; clear CY
+	ret
+
+; Set/add numeric variable.
+; DE = var name, HL = value
+
+setnv:	push	hl		; push value
+	ld	c,80h		; var type = numeric
+	ld	b,0		; lookup user variables
+	call	fndvar
+	jr	nc,nv1		; jump if found
+	ex	de,hl		; get variable name into HL
+	push	hl
+	call	strlen		; obtain length of name
+	ld	b,0
+	push	bc
+	call	avail4		; check avail mem (+len +null +value)
+	pop	bc
+	pop	hl
+	jp	c,nomem0	; pop hl and return error
+	ld	de,(endv)	; point to end of variable area
+	ld	a,c
+	or	80h		; set type = numeric
+	ld	(de),a		; store it
+	inc	de
+	inc	bc		; include null byte
+	ldir			; store name
+	ex	de,hl
+	inc	hl
+	inc	hl
+	ld	(hl),0FFh	; set new end of variables
+	ld	(endv),hl
+	dec	hl
+	dec	hl
+nv1:	pop	de		; pop value
+	ld	(hl),e
+	inc	hl
+	ld	(hl),d		; store value
+	ret
+
+; Get numeric variable
+; DE = var name, returns HL = value or CY if variable not found
+; B = mode (0 = user vars, 1 = system vars)
+
+getnv:	ld	c,80h		; type = numeric var
+	call	fndvar
+	ret	c
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a		; get value into HL
+	or	a		; clear CY
+	ret
+
+; Allocate space and save a string into the dynamic area.
+; HL = string addr. Returns HL = new string addr (text field)
+
+alloc:	push	hl
+	call	strlen		; obtain string length
+	push	bc
+	ld	hl,(bgns)	; get start of dynamic storage area into HL
+alc1:	ld	a,(hl)		; first, look for deleted entries
+	ld	c,a		; remember length
+	inc	a		; end of string space?
+	jr	z,alcnew	; alloc new string if yes
+	inc	hl
+	ld	a,(hl)
+	inc	hl
+	or	(hl)		; free block?
+	jr	z,alc3		; jump if yes
+alc2:	inc	hl
+	ld	b,0
+	inc	bc		; skip over null as well
+	add	hl,bc		; point to next entry
+	jr	alc1		; and loop
+alc3:	ld	a,c
+	pop	bc
+	cp	c		; compare sizes
+	jr	nc,alc4		; OK to use it
+	push	bc
+	ld	c,a
+	jr	alc2		; else try next entry
+alc4:	dec	hl
+alc5:	ld	de,dsptr
+	ld	(hl),e		; init addr field to temporary pointer
+	inc	hl
+	ld	(hl),d
+	inc	hl		; point to text area
+	ld	(dsptr),hl
+	pop	de
+	push	hl		; remember text start address
+	ex	de,hl		; src in HL, dst in DE
+	ld	b,0
+	inc	bc		; include null byte
+	ldir			; copy the string
+	pop	hl		; pop start address
+	or	a		;  clear CY
+	ret			;   and return
+
+alcnew:	pop	bc
+	ld	b,0
+	ld	e,c		; store string length temporarily in E
+	call	avail4		; check for available memory (returns BC += 4)
+	pop	hl
+	ret	c		; return with error if not enough memory
+	push	hl
+	ld	hl,(bgns)
+	or	a
+	sbc	hl,bc
+	ld	(bgns),hl	; else set new start of dynamic region
+	ld	c,e		; restore string length to C
+	ld	(hl),c		; save length
+	inc	hl
+	jr	alc5		; go to common code: store string and return
+
+;-----------------------------------------------------------------------
+
+; Perform garbage collection: compress all entries and remove the
+; deleted ones in a first pass, then move the whole thing to the
+; top of memory in a second pass.
+
+gbcol:	ld	hl,(bgns)	; HL = src pointer
+	ld	e,l		; DE = dst
+	ld	d,h
+gbc1:	ld	c,(hl)		; get length of field
+	inc	c		; end reached?
+	jr	z,gbc5		; jump if yes
+	push	hl		; remember the start of this entry
+	dec	c
+	ld	b,0
+	inc	hl		; point to address field
+	ld	a,(hl)
+	inc	hl
+	or	(hl)		; is this a deleted entry?
+	jr	z,gbc4		; jump if yes
+	inc	hl		; else point to text
+	dec	b		; init char counter to -1
+gbc2:	ld	a,(hl)		; get char from string
+	inc	hl		; advance pointer
+	inc	b		; increment char counter
+	or	a		; end of string?
+	jr	nz,gbc2		; loop if not
+	ld	a,c		; get field length into A
+	sub	b		; string has same length? (all space used?)
+	jr	z,gbc3		; jump if yes
+	ld	c,a		; else save size diff in C
+	pop	hl		; pop entry start address
+	ld	(hl),b		; store new length
+	push	bc
+	ld	c,b
+	ld	b,0		; BC = string length
+	inc	bc		; +len
+	inc	bc		; +addr
+	inc	bc		;
+	inc	bc		; +null
+	ldir			; copy compressed entry
+	pop	bc
+	ld	b,0
+	add	hl,bc		; skip the unused bytes
+	jr	gbc1		;  and loop
+
+; entry fully used, copy it verbatim
+
+gbc3:	pop	hl		; pop entry start address
+	ld	b,0
+	inc	bc		; +len
+	inc	bc		; +addr
+	inc	bc		;
+	inc	bc		; +null
+	ldir			; copy entry to its new location
+	jr	gbc1		;  and loop to process next
+
+; deleted entry, just skip it
+
+gbc4:	pop	hl
+	inc	bc		; +len (B is already zero)
+	inc	bc		; +addr
+	inc	bc		;
+	inc	bc		; +null
+	add	hl,bc		; skip this entry, point to next
+	jr	gbc1		;  and loop
+
+; at this point everything is compressed in low memory, and now we'll move
+; the whole block back to the top.
+
+gbc5:	ld	hl,(memtop)	; if src and dst pointers are the same at this
+	call	hl?de		;  point, then either there were no strings,
+	ret	z		;   or everything was already compressed!
+	ex	de,hl
+	push	hl
+	ld	de,(bgns)
+	or	a
+	sbc	hl,de
+	ld	c,l
+	ld	b,h		; block size in BC
+	pop	hl		; src in HL
+	dec	hl
+	ld	de,(memtop)
+	dec	de		; dst in DE
+	lddr			; move the block up
+	inc	de
+	ld	(bgns),de	; set new start of dynamic string storage
+
+; the last step is to update the address field of all variables pointing
+; to strings in the dynamic region, here the addr field becomes handy.
+
+	ex	de,hl		; get start of dynamic region into HL
+	ld	b,0
+gbc6:	ld	c,(hl)		; check size field
+	inc	c		; end of region reached?
+	ret	z		; return if yes, job done
+	inc	hl		; point to address field
+	ld	e,(hl)		; get var address into DE
+	inc	hl
+	ld	d,(hl)
+	inc	hl		; point to text field,
+	ex	de,hl		;  variables point directly to text
+	ld	(hl),e
+	inc	hl
+	ld	(hl),d
+	ex	de,hl		; restore HL
+	add	hl,bc		;  point to next entry (BC = len+1, see above)
+	jr	gbc6		;   and loop
+
+;-----------------------------------------------------------------------
+
+; Process string expression
+
+sexpr:	ld	hl,(pl)
+	push	hl		; remember start of string
+	ld	bc,0		; B = counter, C = expanded string flag
+	ld	de,lnbuf	; we'll use lnbuf as intermediate buffer
+exps1:	ld	a,max$in-1
+	cp	b		; max length reached?
+	jr	c,stlng		; error if yes
+	ld	a,(hl)
+	inc	hl
+	or	a		; end of string?
+	jr	z,exps6		; finish if yes
+	ld	(de),a		; else copy char to dest
+	inc	de
+	inc	b
+	cp	'%'		; any variables to expand?
+	jr	z,exps11	; loop if not
+	cp	'$'
+	jr	z,exps11
+	jr	exps1
+
+exps11:	ld	(dfill),a	; temp storage
+	push	hl		; push src pos
+	push	de		; push dst pos
+	ld	de,idname
+	call	ename		; extract variable name into idname
+	ld	(pl),hl		; set new src pos
+	jr	c,exps2		; jump if error
+	ld	de,idname
+	push	bc
+	ld	a,(dfill)
+	cp	'%'
+	ld	b,1
+	jr	z,exps12
+	dec	b
+exps12:	call	getsv		; else search for variable
+	pop	bc
+	jr	nc,exps3	; jump if found
+exps2:	pop	de		; else copy name verbatim, pop dst
+	pop	hl		; pop src
+	jr	exps1
+
+exps3:	ld	c,1		; we'll need to allocate dynamic storage
+	pop	de		; restore pointer to dest
+	dec	de		; backup over the '$'
+exps4:	ld	a,(hl)
+	or	a		; check for end of variable text
+	jr	z,exps5
+	ld	(de),a		; else copy chars
+	inc	hl
+	inc	de
+	inc	b
+	ld	a,max$in*2-1	; watch out for overflow
+	cp	b
+	jr	nc,exps4	; loop for more
+	pop	hl		; discard src
+stlng:	pop	hl		; discard start
+	call	errln
+	db	'String too long',0
+	ld	a,1
+	ld	(errflg),a
+	ret
+
+exps5:	pop	hl		; discard old src
+	ld	hl,(pl)		; use new src pointer
+	jr	exps1
+
+exps6:	pop	hl		; restore start of string
+	ld	a,c		; variables expanded?
+	or	a
+	ret	z		; return if not, use static string
+	ld	hl,lnbuf
+	xor	a
+	ld	(de),a
+	call	alloc		; else allocate new string and return
+	ret	nc		; return if no error
+	ld	a,1
+	ld	(errflg),a
+	jp	nomem
+
+; Evaluate string expression, return pointer to new string (possibly
+; in the dynamic area) in HL and in 'dsptr'.
+
+seval:	call	sexpr
+	ld	(dsptr),hl
+	ld	a,(errflg)
+	or	a
+	ret	z
+	jp	snerr		; display error and return with CY set
+
+;-----------------------------------------------------------------------
+
+; Numeric expresssion evaluation routines
+
+; --- getsym
+
+getsym:	ld	a,s$null
+	ld	(symtyp),a
+	ld	hl,(pl)
+	call	skipbl		; skip spaces
+	ld	(pl),hl
+	or	a
+	ret	z
+	push	af
+	ld	a,s$err
+	ld	(symtyp),a
+	pop	af
+	inc	hl
+	cp	'%'		; system variable?
+	ld	b,1
+	jr	z,gsvar
+	cp	'#'		; numeric variable?
+	ld	b,0
+	jr	z,gsvar		; branch if yes
+	dec	hl
+	call	isletr		; if letter, try numeric variable
+	jr	nc,gsvar
+	call	isdig		; number
+	jr	nc,gsnum
+	ex	de,hl
+	ld	hl,ops
+	ld	c,a
+gsym1:	ld	a,(hl)
+	or	a
+	jr	z,gsym2
+	cp	c
+	inc	hl
+	jr	nz,gsym1
+	ex	de,hl
+	inc	hl
+gsym6:	ld	(pl),hl
+	ld	a,s$op
+	ld	(symtyp),a
+	ld	hl,idname
+	ld	(hl),c		; store operator
+	inc	hl
+	ld	(hl),0
+	ret
+gsym2:	ld	hl,(pl)
+	ld	a,(hl)
+	cp	'='
+	ld	c,cnd$eq
+	jr	z,gsym4
+	cp	'<'
+	jr	z,gsym3
+	cp	'>'
+	ret	nz
+	inc	hl
+	ld	a,(hl)
+	cp	'='
+	ld	c,cnd$gt
+	jr	nz,gsym5
+	ld	c,cnd$ge
+	jr	gsym4
+gsym3:	inc	hl
+	ld	a,(hl)
+	cp	'='
+	ld	c,cnd$le
+	jr	z,gsym4
+	cp	'>'
+	ld	c,cnd$lt
+	jr	nz,gsym5
+	ld	c,cnd$ne
+gsym4:	inc	hl
+gsym5:	ld	(pl),hl
+	ld	a,c
+	ld	(cndtyp),a
+	ld	a,s$cond
+	ld	(symtyp),a
+	ret
+
+gsnum:	ex	de,hl
+	call	atoi
+	ld	(idname),hl	; use idname to return the number
+	ex	de,hl
+	ld	(pl),hl
+	ld	a,s$val
+	ld	(symtyp),a
+	ret
+
+gsvar:	ld	(pl),hl
+	ld	de,idname
+	push	bc
+	call	ename		; extract identifier name
+	pop	bc
+;	ret	c
+	push	hl
+	ld	de,idname
+	push	bc
+	call	getnv		; lookup variable
+	pop	bc
+	ex	de,hl
+	pop	hl
+	jr	nc,gsv1
+	ld	de,0		; undefined variables default to zero
+	dec	b		; unless it was a system variable
+	jr	nz,gsv1
+	ld	hl,(pl)
+	ld	c,'%'		; in which case default to % operator
+	jp	gsym6
+gsv1:	ld	(idname),de	; use idname to return the value
+	ld	(pl),hl
+	ld	a,s$val
+	ld	(symtyp),a
+	ret
+
+ops:	db	'+-*/%()',0
+
+; --- factor
+
+factor:	ld	a,(symtyp)
+	cp	s$null
+	ret	z
+	cp	s$val
+	jr	z,fval
+	cp	s$op
+	jr	z,fop
+ferr:	ld	a,1
+	ld	(errflg),a
+	scf
+	ret
+
+fval:	ld	de,(idname)
+fcv1:	push	de
+	call	getsym
+	pop	de
+	ret
+
+fop:	ld	a,(idname)
+	cp	'('
+	jr	nz,ferr
+	call	relop
+	ld	a,(symtyp)
+	cp	s$op
+	jr	nz,ferr
+	ld	a,(idname)
+	cp	')'
+	jr	nz,ferr
+	jr	fcv1
+
+; --- term
+
+term:	call	factor
+term0:	ld	a,(symtyp)
+	cp	s$op
+	ret	nz
+	ld	a,(idname)
+	cp	'*'
+	jr	z,term1
+	cp	'/'
+	jr	z,term1
+	cp	'%'
+	ret	nz
+term1:	push	af
+	push	de		; n
+	call	getsym
+	call	factor		; m in DE
+	pop	hl		; n in HL
+	pop	af
+	cp	'*'
+	jr	nz,term2
+	call	mult		; HL = HL * DE
+	ex	de,hl
+	jr	term0
+term2:	cp	'/'
+	jr	nz,term3
+	call	div		; HL = HL / DE
+	ex	de,hl
+	jr	term0
+term3:	call	div		; DE = HL % DE
+	jr	term0
+
+; --- expr
+
+expr:	call	getsym
+	ld	a,(symtyp)
+	cp	s$op
+	jr	nz,exp2
+	ld	a,(idname)
+	cp	'+'
+	jr	z,exp1
+	cp	'-'
+	jr	nz,exp2
+exp1:	push	af
+	call	getsym
+	call	term
+	pop	af
+	cp	'-'
+	ex	de,hl
+	call	z,hlneg
+	ex	de,hl
+	jr	exp3
+exp2:	call	term
+exp3:	ld	a,(symtyp)
+	cp	s$op
+	ret	nz
+	ld	a,(idname)
+	cp	'+'
+	jr	z,exp4
+	cp	'-'
+	ret	nz
+exp4:	push	af
+	push	de
+	call	getsym
+	call	term
+	ex	de,hl		; m
+	pop	de		; n
+	pop	af
+	cp	'-'
+	call	z,hlneg		; -m
+	add	hl,de
+	ex	de,hl
+	jr	exp3
+
+; --- relop
+
+relop:	call	expr		; n
+	ld	a,(symtyp)
+	cp	s$cond
+	ret	nz
+	ld	a,(cndtyp)
+	push	af
+	push	de
+	call	expr		; m in DE
+	pop	hl		; n in HL
+	pop	af
+	dec	a
+	jr	z,cndeq
+	dec	a
+	jr	z,cndne
+	dec	a
+	jr	z,cndlt
+	dec	a
+	jr	z,cndle
+	dec	a
+	jr	z,cndgt
+	jr	cndge
+cndle:	ex	de,hl
+cndge:	or	a
+	sbc	hl,de
+	ld	de,0
+	ret	m
+	dec	de
+	ret
+cndgt:	ex	de,hl
+cndlt:	or	a
+	sbc	hl,de
+	ld	de,-1
+	ret	m
+	inc	de
+	ret
+cndeq:	call	hl?de
+	ld	de,-1
+	ret	z
+	inc	de
+	ret
+cndne:	call	hl?de
+	ld	de,-1
+	ret	nz
+	inc	de
+	ret
+
+; HL = HL * DE
+
+mult:	push	bc
+	ld	c,d
+	ld	a,e
+	ex	de,hl
+	ld	hl,0
+	call	mult1
+	ld	a,c
+	call	mult1
+	pop	bc
+	ret
+
+mult1:	ld	b,8
+mu1:	rra
+	jr	nc,mu2
+	add	hl,de
+mu2:	ex	de,hl
+	add	hl,hl
+	ex	de,hl
+	djnz	mu1
+	ret
+
+; HL = HL / DE, remainder in DE (signed)
+
+div:	ld	a,h
+	xor	d
+	push	af		; remember if quotient sign has to be changed
+	ld	a,h
+	or	a
+	push	af		; remember dividend sign
+	call	m,hlneg
+	ex	de,hl
+	ld	a,h
+	or	a
+	call	m,hlneg
+	ld	c,l
+	ld	b,h
+	ld	hl,0
+	ld	a,16
+dv1:	push	af
+	add	hl,hl
+	ex	de,hl
+	sub	a
+	add	hl,hl
+	ex	de,hl
+	adc	a,l
+	sub	c
+	ld	l,a
+	ld	a,h
+	sbc	a,b
+	ld	h,a
+	inc	de
+	jr	nc,dv2
+	add	hl,bc
+	dec	de
+dv2:	pop	af
+	dec	a
+	jr	nz,dv1
+	pop	af
+	call	m,hlneg
+	ex	de,hl
+	pop	af
+	call	m,hlneg		; remainder has same sign as dividend
+	ret
+
+; Evaluate numeric expression, return result in DE
+
+eval:	call	relop
+	ld	a,(errflg)
+	or	a
+	ret	z
+	jp	snerr		; display error and return with CY set
+
+;-----------------------------------------------------------------------
+
+; Run program
+
+exec:	call	clrvar		; clear all variables
+	ld	hl,0
+	ld	(usp),hl	; reset user subroutine stack
+	xor	a
+	ld	(cmd),a		; clear last command char
+	ld	(ccmd),a	;  and last condition result
+	ld	(mtchd),hl	; and matched flag
+rjump:	ld	bc,(ln)
+	call	findln		; find line
+	ret	c
+	ld	(begln),hl	; we'll use begln as current line pointer
+rloop:	ld	hl,(prgln)
+	ld	de,(ln)
+	call	hl?de		; end of program reached?
+	ret	nc
+	call	chkey
+	or	a
+	jr	z,nokey
+	call	getc
+	cp	3		; ctrl-c?
+	jp	z,brkln		; break execution if yes
+nokey:	ld	hl,(begln)
+	inc	hl
+	ld	a,(trflg)	; trace enabled?
+	or	a
+	jr	z,rskip		; skip line display if not
+	push	hl
+	ld	a,' '
+	ld	(dfill),a
+	ld	hl,(ln)
+	inc	hl
+	call	uhldec		; display line number
+	ld	a,' '
+	call	typea		; add a space
+	pop	hl
+	push	hl
+	call	putstr		; display line contents
+	call	crlf
+	pop	hl
+rskip:	call	skipbl		; get command character
+	ld	(pl),hl		; setup pointer to text
+	call	ucase
+	or	a
+	jp	z,rnext		; skip empty lines
+	cp	'*'
+	jp	z,label		; skip label names
+	cp	':'
+	jp	z,rexec		; execute previous command
+	ld	(cmd),a		; remember new command letter
+	xor	a
+	ld	(cmd2),a	; clear second command char
+	ld	(ccmd),a	; and last condition result
+	inc	hl
+	call	skipbl		; check next char
+	call	ucase
+	cp	':'		; if semicolon
+	jp	z,exec1		;  go execute command
+	cp	'Y'
+	ld	c,0FFh
+	jr	z,cond1		; else check for conditions
+	cp	'N'
+	ld	c,0
+	jr	z,cond1
+	cp	'('
+	jr	z,cond2
+	cp	'H'
+	jr	z,flagh		; TH or CH?
+	cp	'A'
+	jr	z,flags		; CA, CL or CE?
+	cp	'L'
+	jr	z,flags
+	cp	'E'
+	jr	z,flags
+	cp	'M'
+	jr	z,flagm		; JM or UM?
+snerr:	call	errln
+	db	'Syntax error',0
+	scf
+	ret
+
+label:	inc	hl
+	call	evname
+	jr	rskip
+
+cond1:	inc	hl
+	call	skipbl
+	cp	':'		; semicolon must follow
+	jr	nz,snerr
+	ld	a,(mtchd)
+	add	a,0FFh
+	sbc	a,a
+	cp	c		; condition match?
+	jr	z,exec1		; exec command if yes
+	jp	rnext		; else skip it
+
+cond2:	ld	(pl),hl
+	call	eval
+	pop	bc
+	ret	c
+	push	bc
+	ld	hl,(pl)
+	call	skipbl
+	cp	':'		; semicolon must follow
+	jr	nz,snerr
+	ld	a,d
+	or	e
+	jr	nz,exec1
+	jp	rnext
+
+rexec:	ld	a,(ccmd)	; check last condition result
+	or	a
+	jr	nz,exec1	; re-execute command if set
+	jp	rnext
+
+flagm:	ld	(cmd2),a
+	ld	a,(cmd)
+	cp	'J'		; for J or U command
+	jr	z,fl2
+	cp	'U'
+	jr	z,fl2
+	jr	snerr
+flagh:	ld	(cmd2),a
+	ld	a,(cmd)
+	cp	'T'		; for T or C command
+	jr	z,fl2
+	jr	fl1
+flags:	ld	(cmd2),a
+	ld	a,(cmd)
+fl1:	cp	'C'		; only for C command
+	jr	nz,snerr
+fl2:	inc	hl
+	call	skipbl
+	cp	':'		; semicolon must follow
+	jp	nz,snerr
+exec1:	ld	a,0FFh
+	ld	(ccmd),a	; remember last condition result was true
+	inc	hl		; skip over semicolon
+	ld	bc,rnext
+	push	bc		; push return address
+	ld	(pl),hl
+	ld	a,(cmd)
+	cp	'T'		; Type
+	jp	z,cmdT
+	cp	'A'		; Accept
+	jp	z,cmdA
+	cp	'I'		; Input
+	jp	z,cmdI
+	cp	'M'		; Match
+	jp	z,cmdM
+	cp	'J'		; Jump
+	jp	z,cmdJ
+	cp	'U'		; User call
+	jp	z,cmdU
+	cp	'E'		; End
+	jp	z,cmdE
+	cp	'C'		; Compute
+	jp	z,cmdC
+	cp	'R'		; Remark
+	ret	z
+	pop	bc		; discard return address
+	call	errln
+	db	'Unrecognized command',0
+	ret
+
+rnext:	ld	hl,(ln)
+	inc	hl
+	ld	(ln),hl
+	ld	hl,(begln)
+	ld	e,(hl)
+	ld	d,0
+	inc	de
+	inc	de
+	add	hl,de
+	ld	(begln),hl
+	jp	rloop
+
+; ----- Type -----
+
+cmdT:	ld	hl,(pl)
+t1:	ld	a,(hl)
+	or	a
+	jp	z,t20
+	cp	'\'		; escape character?
+	jr	nz,t2
+;	inc	hl
+;	ld	a,(hl)
+;	or	a
+	call	escchr		; handle \t \n, etc
+	jp	z,t20
+	call	typea
+	inc	hl
+	jr	t1
+t2:	cp	'$'		; string variable?
+	jr	nz,t3		; jump if not
+	push	hl
+	inc	hl
+	call	evname		; extract variable name
+	ld	(pl),hl		; save pointer to text
+	jr	c,t42		; jump if variable name error
+	ld	de,vname
+	ld	b,0
+	call	getsv		; get variable value
+	jr	c,t42		; jump if variable not found
+	call	putstx		; expand variable
+	pop	hl
+	ld	hl,(pl)		; restore HL
+	jr	t1		;  and continue
+t3:	cp	'#'		; numeric variable?
+	jr	nz,t4		; jump if not
+	push	hl
+	inc	hl
+	call	evname		; extract variable name
+	ld	(pl),hl		; save text pointer
+	jr	c,t42		; jump if variable name error
+	ld	de,vname
+	ld	b,0
+	call	getnv		; get variable value
+	jr	c,t42
+	xor	a
+	ld	(dfill),a
+	call	hldec		; display the value without padding
+	pop	hl
+	ld	hl,(pl)		; restore HL
+	jr	t1		;  and continue
+t4:	cp	'%'		; special variable?
+	jr	nz,t5		; jump if not
+	push	hl
+	inc	hl
+	call	evname		; extract variable name
+	ld	(pl),hl		; save text pointer
+	jr	c,t42		; jump if error
+	ld	de,vname
+	ld	b,1
+	call	getsv		; try system string var
+	jr	c,t41
+	call	putstx		; expand variable
+	pop	hl
+	ld	hl,(pl)		; restore HL
+	jr	t1		;  and continue
+t41:	ld	b,1
+	call	getnv		; try system numeric var
+	jr	c,t42
+	xor	a
+	ld	(dfill),a
+	call	hldec		; display the value without padding
+	pop	hl
+	ld	hl,(pl)		; restore HL
+	jp	t1		;  and continue
+t42:	pop	hl
+	ld	a,(hl)
+	call	typea
+	inc	hl
+	jp	t1
+t5:	call	typea
+	inc	hl
+	jp	t1
+t20:	ld	a,(cmd2)
+	cp	'H'		; TH: command?
+	call	nz,crlf		; display cr/lf if not
+	ret
+
+; ----- Accept or Ask -----
+
+cmdA:	call	getstr
+	ld	a,(brkflg)	; ctrl-c detected?
+	or	a
+	jr	z,setai
+	pop	bc		; discard return address
+	jp	brkln		; stop execution
+
+; ----- Input -----
+
+cmdI:	call	getc
+	cp	3		; ctrl-c?
+	jr	nz,ci1
+	pop	bc		; discard return address
+	jp	brkln		; stop execution
+ci1:	ld	hl,lnbuf
+	ld	(hl),a
+	inc	hl
+	ld	(hl),0
+;;	call	typea
+setai:	ld	hl,lnbuf
+	push	hl
+	call	strlen
+	pop	hl
+	ld	de,answer
+	ld	b,0
+	inc	bc		; include null byte
+	ldir			; copy string to answer buffer
+	ld	hl,(pl)
+	call	skipbl
+	or	a
+	ret	z
+	inc	hl
+	cp	'$'
+	jr	nz,ci2
+	call	evname		; extract variable name
+	jr	c,verr0
+	ld	hl,lnbuf
+	call	alloc		; allocate space for new string
+	jr	c,nomem0
+	ld	de,vname
+	call	setsv		; set/add variable
+	ret	nc
+	pop	bc		; terminate program on errors
+	ret
+ci2:	cp	'#'
+	jr	nz,verr0
+	call	evname
+	jr	c,verr0
+	ld	hl,lnbuf
+	call	skipbl
+	ex	de,hl
+	call	atoi
+	ld	de,vname
+	call	setnv
+	ret	nc
+	pop	bc
+	ret
+
+verr0:	pop	bc		; return one level higher
+verr:	call	errln
+	db	'Illegal variable name',0
+	ret
+
+nomem0:	pop	bc
+nomem:	call	errln
+	db	'Out of memory',0
+	scf
+	ret
+
+; ----- Match -----
+
+cmdM:	ld	b,0
+cm0:	inc	b
+	ld	hl,(pl)
+	call	skipbl
+	or	a		; end of string?
+	jr	z,cm4		; set mtchd = 0 and return if yes
+	ld	de,lnbuf
+cm1:	ld	a,(hl)		; get string until comma or end into lnbuf
+	ld	(de),a
+	or	a
+	jr	z,cm2
+	cp	','
+	jr	z,cm2
+	inc	hl
+	inc	de
+	jr	cm1
+cm2:	xor	a
+	ld	(de),a		; end string with a zero
+	ld	(pl),hl		; save pointer
+	ld	hl,answer
+	call	skipbl
+	ld	de,lnbuf
+	call	match		; strings match?
+	jr	nc,cm3		; set mtchd = B and return if yes
+	ld	hl,(pl)		; else try next chunk
+	ld	a,(hl)
+	or	a		; end of string?
+	jr	z,cm4		; set mtchd = 0 and return if yes
+	inc	hl		; else skip over comma
+	ld	(pl),hl
+	jr	cm0		; and loop
+cm3:	ld	a,b
+cm4:	ld	(mtchd),a
+	ret
+
+; ----- Jump -----
+
+cmdJ:	ld	a,(cmd2)
+	cp	'M'
+	ld	b,1
+	jr	nz,cj1
+	ld	a,(mtchd)
+	or	a
+	ret	z
+	ld	b,a
+	ld	hl,(pl)
+cj1:	call	skipbl
+	cp	'*'
+	jr	nz,cj2
+	inc	hl
+cj2:	push	bc
+	call	evname		; extract label name
+	pop	bc
+	jr	c,badlb0
+	dec	b
+	jr	z,cj3
+	call	skipbl
+	or	a
+	ret	z
+	cp	','
+	inc	hl
+	jr	z,cj1
+	ret			; no label for this matched value, return
+cj3:	ld	de,vname
+	call	fndlbl		; find label in program
+	jr	c,nolb0
+	ld	(ln),bc
+	pop	bc		; discard return address
+	jp	rjump
+
+badlb0:	pop	bc
+badlb:	call	errln
+	db	'Illegal label',0
+	ret
+
+nolb0:	pop	bc
+nolb:	call	errln
+	db	'Label not found',0
+	ret
+
+; ----- User subroutine -----
+
+cmdU:	ld	a,(cmd2)
+	cp	'M'
+	ld	b,1
+	jr	nz,cu0
+	ld	a,(mtchd)
+	or	a
+	ret	z
+	ld	b,a
+cu0:	ld	de,(usp)
+	ld	hl,max$u-1
+	call	hl?de
+	jr	nc,stkov0
+	ld	hl,(pl)
+cu1:	call	skipbl
+	cp	'*'
+	jr	nz,cu2
+	inc	hl
+cu2:	push	bc
+	call	evname		; extract label name
+	pop	bc
+	jr	c,badlb0
+	dec	b
+	jr	z,cu3
+	call	skipbl
+	or	a
+	ret	z
+	cp	','
+	inc	hl
+	jr	z,cu1
+	ret
+cu3:	ld	de,vname
+	call	fndlbl		; find label in program
+	jr	c,nolb0
+	ld	hl,(usp)
+	inc	hl
+	ld	(usp),hl
+	dec	hl
+	add	hl,hl
+	ld	de,ustack
+	add	hl,de
+	ld	de,(ln)
+	inc	de
+	ld	(hl),e		; push value
+	inc	hl
+	ld	(hl),d
+	ld	(ln),bc		; jump to new line
+	pop	bc		; discard return address
+	jp	rjump
+
+stkov0:	pop	bc
+stkov:	call	errln
+	db	'Too many subroutines nested',0
+	ret
+
+; ----- End program or subroutine -----
+
+cmdE:	pop	bc		; discard return address
+	ld	hl,(usp)
+	ld	a,h
+	or	l		; stack empty?
+	ret	z		; end program
+	dec	hl
+	ld	(usp),hl
+	add	hl,hl		; word pointer
+	ld	de,ustack	; add offset
+	add	hl,de
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a		; pop value
+	ld	(ln),hl		; set line number
+	jp	rjump		; and loop
+
+; ----- Compute & Screen control -----
+
+cmdC:	ld	a,(cmd2)
+	cp	'H'
+	jr	z,cmdCH
+	cp	'A'
+	jr	z,cmdCA
+	cp	'L'
+	jr	z,cmdCL
+	cp	'E'
+	jr	z,cmdCE
+	ld	hl,(pl)
+	call	skipbl
+	cp	'$'
+	jr	nz,cc1
+	inc	hl
+	call	evname		; extract variable name
+	jp	c,verr0
+	call	skipbl
+	cp	'='
+	pop	bc
+	jp	nz,snerr	; syntax error
+	push	bc
+	inc	hl
+	ld	(pl),hl
+	call	seval		; evaluate string expression
+	pop	bc
+	ret	c
+	push	bc
+	ld	de,vname
+	call	setsv
+	ret	nc
+	pop	bc
+	ret
+
+cc1:	cp	'#'
+	jr	nz,cc2
+	inc	hl
+cc2:	call	evname		; extract variable name
+	jp	c,verr0
+	call	skipbl
+	cp	'='
+	pop	bc
+	jp	nz,snerr	; syntax error
+	push	bc
+	inc	hl
+	ld	(pl),hl
+	call	eval
+	pop	bc
+	ret	c
+	push	bc
+	ex	de,hl
+	ld	de,vname
+	call	setnv
+	ret	nc
+	pop	bc
+	ret
+
+; ----- Clear + Home -----
+
+cmdCH:	call	print
+	db	esc,'[H',0
+	; fall thru
+
+; ----- Clear End of screen -----
+
+cmdCE:	call	print
+	db	esc,'[J',0
+	ret
+
+; ----- Clear end of Line -----
+
+cmdCL:	call	print
+	db	esc,'[K',0
+	ret
+
+; ----- Cursor Address -----
+
+cmdCA:	ld	hl,(pl)
+	call	skipbl
+	cp	'#'
+	jr	nz,cca1
+	inc	hl
+	call	evname		; extract variable name
+	ld	(pl),hl
+	jp	c,snerr		; jump if variable name error
+	ld	de,vname
+	ld	b,0
+	call	getnv		; get variable value
+	jr	nc,cca2
+	ld	hl,1		; default to row 1 if var undefined
+	jr	cca2
+cca1:	ex	de,hl
+	call	atoi
+	ld	(pl),de
+cca2:	ld	c,l
+	ld	b,h
+	ld	hl,(pl)
+	call	skipbl
+	cp	','
+	jp	nz,snerr
+	inc	hl
+	call	skipbl
+	cp	'#'
+	jr	nz,cca3
+	inc	hl
+	push	bc
+	call	evname		; extract variable name
+	pop	bc
+	ld	(pl),hl
+	jp	c,snerr		; jump if variable name error
+	ld	de,vname
+	push	bc
+	ld	b,0
+	call	getnv		; get variable value
+	pop	bc
+	jr	nc,cca4
+	ld	hl,1		; default to row 1 if var undefined
+	jr	cca4
+cca3:	ex	de,hl
+	call	atoi
+	ld	(pl),de
+cca4:	push	hl		; col
+	push	bc		; row
+	call	print
+	db	esc,'[',0
+	xor	a
+	ld	(dfill),a
+	pop	hl
+	call	uhldec		; display the value without padding
+	ld	a,';'
+	call	typea
+	pop	hl
+	call	uhldec
+	ld	a,'H'
+	call	typea
+	ret
+
+;-----------------------------------------------------------------------
+
+; Read character from console (no echo)
+
+getc:	push	hl
+	push	de
+	push	bc
+gc1:	ld	e,0FFh
+	ld	c,6
+	call	bdos
+	or	a
+	jr	z,gc1
+	pop	bc
+	pop	de
+	pop	hl
+	ret
+
+; Check for character ready
+
+chkey:	push	hl
+	push	de
+	push	bc
+	ld	e,0FEh
+	ld	c,6
+	call	bdos
+	pop	bc
+	pop	de
+	pop	hl
+	ret
+
+; Display character on console
+
+putc:	push	hl
+	push	de
+	push	bc
+	ld	e,c
+	ld	c,6
+	call	bdos
+	pop	bc
+	pop	de
+	pop	hl
+	ret
+
+typea:	push	bc
+	ld	c,a
+	call	putc
+	pop	bc
+	ret
+
+; Make FCB from string. HL = string, DE = FCB
+
+mkfcb:	xor	a
+	ld	(de),a		; clear disk
+	ld	a,(hl)
+	or	a
+	jr	z,nodsk
+	inc	hl
+	ld	a,(hl)
+	dec	hl
+	cp	':'		; explicit disk specification?
+	jr	nz,nodsk
+	ld	a,(hl)
+	call	ucase
+	sub	'A'		; get disk number
+	jr	c,nodsk
+	cp	10h
+	jr	nc,nodsk
+	inc	a
+	ld	(de),a
+	inc	hl		; skip over disk spec
+	inc	hl
+nodsk:	inc	de
+	ld	b,8
+	call	getnam
+mkf1:	ld	a,(hl)
+	call	chkend
+	jr	z,mkf2
+	inc	hl
+	cp	'.'
+	jr	nz,mkf1
+mkf2:	ld	(extflg),a
+	ld	b,3
+	call	getnam
+clrmap:	ld	b,24
+	xor	a
+mkfill:	ld	(de),a		; clear FCB block map
+	inc	de
+	djnz	mkfill
+	ret
+
+getnam:	ld	a,(hl)
+	call	chkdot
+	jr	z,gn1
+	cp	'*'
+	jr	z,gn2
+	call	ucase
+	ld	(de),a
+	inc	hl
+	inc	de
+	djnz	getnam
+	ret
+gn1:	inc	b
+	dec	b
+	ret	z
+	ld	a,' '
+	jr	mkfill
+gn2:	inc	b
+	dec	b
+	ret	z
+	ld	a,'?'
+	jr	mkfill
+
+chkdot:	cp	'.'
+	ret	z
+chkend:	or	a
+	ret	z
+	cp	' '
+	ret	z
+	cp	tab
+	ret
+
+; Check whether FCB contains wilcard chars
+
+chkfwc:	ld	hl,cpmfcb+1
+	ld	b,8+3
+cf1:	ld	a,(hl)
+	cp	'?'
+	ret	z
+	inc	hl
+	djnz	cf1
+	or	0FFh
+	ret
+
+; Add .PLT extension to FCB if none was specified
+
+addext:	ld	a,(extflg)
+	cp	'.'
+	ret	z
+	ld	hl,cpmfcb+8+1
+	ld	a,(hl)
+	cp	' '
+	ret	nz
+	ld	(hl),'P'
+	inc	hl
+	ld	(hl),'L'
+	inc	hl
+	ld	(hl),'T'
+	ret
+
+; Returns Z if FCB is empty
+
+efcb?:	ld	a,(cpmfcb+1)
+	cp	' '
+	ret	nz
+	ld	a,(cpmfcb+8+1)
+	cp	' '
+	ret	nz
+	ld	a,(extflg)
+	or	a
+	ret
+
+; Create new file, backup the old one
+
+fcreat:	ld	hl,cpmfcb
+	ld	de,cpmfcb+16
+	ld	bc,8+1
+	ldir
+	ex	de,hl
+	ld	(hl),'B'
+	inc	hl
+	ld	(hl),'A'
+	inc	hl
+	ld	(hl),'K'
+	ld	de,cpmfcb+16
+	ld	c,19
+	call	bdos		; delete any old backup files
+	ld	de,cpmfcb
+	ld	c,23		; rename file
+	call	bdos
+	ld	de,cpmfcb+8+3+1
+	call	clrmap
+	xor	a
+	ld	(fcnt),a	; clear byte counter
+	ld	de,cpmfcb
+	ld	c,22		; create file
+	call	bdos
+	inc	a
+	ret	nz
+	scf
+	ret
+
+fputc:	push	hl
+	ld	c,a
+	ld	a,(fcnt)
+	inc	a
+	ld	(fcnt),a
+	ld	b,a
+	dec	a
+	ld	hl,cpmbuf
+	call	addhla
+	ld	(hl),c
+	pop	hl
+	ld	a,b
+	cp	80h
+	ccf			; no CY
+	ret	nz
+	xor	a
+	ld	(fcnt),a
+fwrite:	push	hl
+	ld	de,cpmfcb
+	ld	c,21		; write record
+	call	bdos
+	pop	hl
+	or	a
+	ret	z
+	scf
+	ret
+
+fwreof:	ld	a,(fcnt)
+	or	a
+	ret	z
+	push	hl
+	ld	b,a
+	ld	hl,cpmbuf
+	call	addhla
+fw1:	ld	(hl),1Ah
+	inc	hl
+	inc	b
+	ld	a,b
+	cp	80h
+	jr	nz,fw1
+	pop	hl
+	jr	fwrite
+
+; Open CP/M file, returns CY on error.
+
+fopen:	ld	a,80h
+	ld	(fcnt),a
+	ld	de,cpmfcb
+	ld	c,15
+	call	bdos
+	inc	a
+	ret	nz
+	scf
+	ret
+
+fgetc:	ld	a,(fcnt)
+	cp	80h
+	jr	nz,fget1
+	push	hl
+	ld	de,cpmfcb
+	ld	c,20		; read record
+	call	bdos
+	pop	hl
+	or	a
+	scf
+	ret	nz
+fget1:	inc	a
+	ld	(fcnt),a
+	dec	a
+	push	hl
+	ld	hl,cpmbuf
+	call	addhla
+	ld	a,(hl)
+	pop	hl
+	or	a
+	ret
+
+; Close CP/M file
+
+fclose:	ld	de,cpmfcb
+	ld	c,16		; close file
+	call	bdos
+	inc	a
+	ret	nz
+	scf
+	ret
+
+; Directory search
+
+fndfst:	push	de
+	ld	de,cpmfcb
+	ld	c,17		; search first
+	call	bdos
+	inc	a
+	pop	de
+	ret
+
+fndnxt:	push	de
+	ld	de,cpmfcb
+	ld	c,18		; search next
+	call	bdos
+	inc	a
+	pop	de
+	ret
+
+; Print file name from FCB.
+
+prntfn:	ld	b,8
+	call	pfn1
+	ld	a,'.'
+	call	typea
+	ld	b,3
+pfn1:	ld	a,(hl)
+	and	7Fh		; mask any attrib bits
+	call	typea
+	inc	hl
+	djnz	pfn1
+	ret
+
+;-----------------------------------------------------------------------
+
+	dseg
+
+	ds	256	; interpreter stack space
+stack	equ	$
+
+fcnt:	ds	1	; counter for file I/O operations
+extflg:	ds	1	; explicit (possibly empty) extension specified
+
+dfill:	ds	1	; hldec/uhldec fill character
+
+errflg:	ds	1	; error flag
+brkflg:	ds	1	; break flag
+trflg:	ds	1	; trace flag
+
+ustack:	ds	max$u*2	; stack for user subroutine call
+usp:	ds	2	; user call stack pointer
+pl:	ds	2	; pointer to program line during execution
+ln:	ds	2	; current line number
+prgln:	ds	2	; total program lines
+begln:	ds	2	; begin line in multi-line commands
+endln:	ds	2	; end line in multi-line commands
+
+cmd:	ds	1	; last/current command executed
+cmd2:	ds	1	; second character of double-char commands
+ccmd:	ds	1	; conditional value of last/current command
+mtchd:	ds	2	; matched flag, hi-byte is always 0 (but needed)
+symtyp:	ds	1	; symbol type during expr eval (symbol in lnbuf)
+cndtyp:	ds	1	; conditional type
+
+lnbuf:	ds	max$in	; contains the input line
+answer:	ds	max$in	; answer buffer
+
+vname:	ds	13	; temporary storage for variable name
+idname:	ds	13	; temporary storage for expression identifiers
+
+memtop:	ds	2	; top of memory
+
+dsptr:	ds	2	; pointer to string being allocated in dynamic area
+endp:	ds	2	; pointer to end of program (start of vars)
+endv:	ds	2	; pointer to end of variable area
+bgns:	ds	2	; pointer to start of dynamic string storage
+pgm	equ	$	; start of program and variable area
+
+; The program grows from here up to the top of available memory. The program
+; is stored as follows:
+;
+;   +---+----------+---+---+----------+---+-     -+---+----------+---+---+
+;   |len|   text   | 0 |len|   text   | 0 |  ...  |len|   text   | 0 | FF|
+;   +---+----------+---+---+----------+---+-     -+---+----------+---+---+
+;     ^                                                                ^
+;    pgm                                                              endp
+;
+; All program lines are chained one after the other. The string null
+; terminator is redundant, but makes the interpreter's job easier.
+; 'len' is the length of the string, not counting the null terminator.
+;
+; The variable area grows from the end of the program up to the top of
+; available memory. The variables are stored using the following structure:
+;
+;   +---+----------+---+-----+-     -+---+----------+---+-----+---+
+;   |len|   name   | 0 |value|  ...  |len|   name   | 0 |value| FF|
+;   +---+----------+---+-----+-     -+---+----------+---+-----+---+
+;     ^                                                         ^
+;  endp+1                                                      endv
+;
+; The name field can be up to 12 characters. The length field has the
+; MSB set to 1 if the variable is numeric. The value is either a pointer
+; to a string for text variables (which can point to program text in
+; core or to a string in the dynamic storage region), or the numeric
+; value for numeric variables.
+;
+; From the top of memory down grows the dynamic string storage area.
+; Space is allocated in a first-fit fashion. Garbage collection happens
+; when no space can be allocated for a new string. Strings are stored
+; like this:
+;
+;   +---+------+---------+---+-     -+---+------+----------+---+---+
+;   |len| addr |   text  | 0 |  ...  |len| addr |   text   | 0 | FF|
+;   +---+------+---------+---+-     -+---+------+----------+---+---+
+;     ^                                                          ^
+;   bgns                                                      memtop
+;
+; The length field here represents the size of the allocated space,
+; excluding the null terminator, and which is not necessarily the same
+; as the length of the string, since the space may have been freed and
+; reallocated to a smaller string (here the null terminator becomes useful).
+; The addr field points back to the value field of the associated variable,
+; and is set to zero after the space has been freed.
+
+	end	start

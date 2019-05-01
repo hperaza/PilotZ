@@ -1,0 +1,455 @@
+Program invocation
+------------------
+
+ PILOTZ
+
+ PILOTZ filename
+
+When invoked with a filename in the command line, the interpreter loads
+and executes the file and returns back to the operating system once the
+program ends.
+
+Without the filename, the interpreter enters the interactive mode.
+
+
+Interactive mode commands
+-------------------------
+
+The prompt is :)
+Commands can be typed in upper- or lowercase.
+
+BYE
+
+  Exit back to CP/M. If the current program was not saved it will be lost,
+  no questions asked.
+
+DELETE [n1]-[n2]
+
+  Delete lines from n1 to n2 inclusive. If n1 is omitted, lines are erased
+  starting from the first one up to and including n2. If n2 is not specified,
+  lines are erased from n1 up to the end of the program. At least one line
+  must be specified.
+
+  Examples:
+
+   DELETE 5-10
+   DELETE 20-
+   DELETE -10
+   DELETE 8
+
+DIR [filespec]
+
+  Display disk directory. If filespec is not specified, *.* is assumed.
+
+EDIT n
+
+  Edit (replace) the specified line. The old line is displayed on the
+  terminal and the program prompts for a new (replacement) one.
+
+HELP or ?
+
+  Lists the interactive mode commands.
+
+INSERT n
+
+  Switch to program input mode and insert lines at the specified position.
+  Use Ctrl-C to switch back to the interactive mode prompt.
+
+LIST [n1]-[n2]
+
+  List program lines from n1 to n2 inclusive. If n1 is omitted, the program
+  is listed starting from the first line. If n2 is ommited, the program is
+  listed starting from that line up to the last one. To list a single line,
+  just specify its number without the dash. To list the full program, enter
+  the command with no arguments.
+
+  Examples:
+
+   LIST 10-20
+   LIST -20
+   LIST 100-
+   LIST
+   LIST 8
+
+  To pause the display use Ctrl-S, resume with Ctrl-Q. To abort the listing
+  use Ctrl-C.
+
+LOAD filename
+
+  Load file from disk. Any previous program in memory is lost, no questions
+  asked. If no extension is specified, .PLT is assumed.
+
+MEM
+
+  Show the amount of memory used by program and variables, as well as the
+  available free space.
+
+NEW
+
+  Erase old program and switch to program input mode. Use Ctrl-C to return
+  to the interactive mode prompt.
+
+RUN [n]
+
+  Execute program from the beginning, or from line n if specified. All
+  variables are erased prior to execution. Program execution can be aborted
+  at any time with Ctrl-C.
+
+SAVE filename
+
+  Save the program to a disk file with the specified name. If no extension
+  is specied, .PLT will be added.
+
+TRACE [n]
+
+  Trace program execution, starting from the beginning or from line n if
+  specified. Works like the RUN command, but lines are printed on the
+  terminal prior to execution.
+
+VARS [%]
+
+  Show variables and their values. If the special character % is specified,
+  the system variables will be also displayed.
+
+
+Variables
+---------
+
+Two types of variables are supported: string and numeric:
+
+ * String variables can contain an arbitrary sequence of ASCII characters,
+   including spaces, up to 255 characters in length. They are normally
+   preceded by a dollar sign ($).
+
+ * Numeric variables are signed integers in the range -32768..32767.
+   They are normally preceded by a hash sign (#).
+
+Variable names can be of any length, but only the first 12 characters are
+significant. Names are case-insensitive and can contain both letters,
+numbers, and the @, ? and _ characters. They must begin with a letter.
+
+In addition, a number of system variables exist:
+
+ANSWER
+
+  String type, contains the user response to the last Accept statement.
+
+MATCHED
+
+  Numeric type, contains the result of the last Match statement.
+
+MAXUSES
+
+  Numeric type, gives the maximum number of nested Use statements allowed.
+
+USELEVEL
+
+  Numeric type, contains the current Use nesting level.
+
+Special variables are always preceded by a percent sign (%), regardless of
+their type.
+
+
+Operators
+---------
+
+The arithmetic operations available in numeric expressions are:
+
+  +   addition
+  -   subtraction
+  *   multiplication
+  /   division
+  %   modulo (remainder)
+
+Operators follow the standard precedence rules. In addition, parentheses
+can be used to group sub-expressions.
+
+Error conditions such as overflow and division by zero are ignored.
+
+Relational operators are normally used in conditionals:
+
+  >   greater than
+  <   less than
+  =   equals
+  <>  not equals
+  >=  greater than or equal to
+  <=  less than or equal to
+
+
+Labels
+------
+
+Labels begin with an asterisk (*) and are the destination of Jump and
+Use statements. Names follow the variable name convention rules: case
+insensitive, only the first 12 characters are significant.
+
+Example:
+
+  TH:Do you need help? 
+  A :
+  M :Y
+  UY:*HELP
+     ...
+  *HELP
+  T :Help is available for the following commands:
+     ...
+
+
+Program statements
+------------------
+
+The interpreter understands the usual PILOT statements:
+
+T:message    (Type)
+
+  Displays a message followed by a newline. If the message contains
+  references to numeric, string or system variables, the value is expanded
+  and displayed. Certain escape sequences are also recognized (see below).
+
+  Example:
+
+    T:Hello, world!
+
+TH:message    (TypeHang)
+
+  Same as the Type statement, except that it omits the newline at the end
+  of the output. Normally used for doing prompt and input on one line.
+
+  Example:
+
+    TH:Please enter your name:
+    A :$name
+
+A:[variable]    (Accept)
+
+  Waits for user response. The user input is stored in 'variable', if
+  specified, as well as in the ANSWER system variable.
+
+  The line can be edited in the standard way and finished with Return. 
+  Ctrl-C aborts program execution.
+
+  Example:
+
+    T:What is your name?
+    A:$name
+
+I:[variable]    (Input)
+
+  Similar to Accept, but waits for a single keystroke. The single-character
+  input is stored in 'variable', if specified, as well as in the ANSWER
+  system variable.
+
+M:list    (Match)
+
+  Compares every item in 'list' with the last response stored in the system
+  variable ANSWER. Case is ignored. If a match is found, the YN conditional
+  flag is set to true, and the MATCHED system variable will contain the
+  1-based item number in the list that matched the response. Else the YN flag
+  is set to false and MATCHED to 0.
+
+  The comparison is done using a sliding-string algorithm.
+
+  Example:
+
+    T:Please name a vowel
+    A:$answer
+    M:A,E,I,O,U,Y
+    TY:Correct!
+    TN:Sorry, $answer is not a vowel
+
+  Note that the comparison algorithm looks for any occurrence of the
+  list item in ANSWER, and not the other way around. Thus:
+
+    A:
+    M:Y
+
+  will match a user response of e.g. Y, YES, or YEAH, while
+
+    A:
+    M:YES
+
+  will require an explicit YES response from the user (or something like
+  e.g. YESSIR).
+
+J:label    (Jump)
+
+  Jumps to the specified destination in the current program.
+
+  Example:
+
+    *START
+      ...
+    T:Run the program again?
+    A:
+    M:Y
+    JY:*START
+    E:
+
+JM:label,label,...    (JumpMatch)
+
+  Dispatches on the value of the MATCHED system variable, which is set by
+  the Match statement:
+
+  * If the MATCHED value is zero, the JM statement is ignored and control
+    passes to the next statement.
+
+  * If the MATCHED value is non-zero and less than or equal to the number
+    of labels in the label list of the JM statement, the label indexed by
+    it (counting from the left) is jumped to.
+
+  * If the MATCHED value is out of range, the JM statement is ignored.
+
+  Example:
+
+    TH:Enter section number: 
+    A :
+    M :1,2,3
+    JM:*SECTION1,*SECTION2,*SECTION3
+
+U:label    (Use)
+
+  Calls the specified procedure in the current program.
+
+  Example:
+
+    T:Do you need instructions?
+    A:
+    M:Y
+    UY:*INSTRUCTIONS
+      ...
+    *INSTRUCTIONS
+    T:Instructions:
+      ...
+    E:
+
+UM:label,label,...    (UseMatch)
+
+  Calls a procedure depending on the value of the MATCHED system variable,
+  which is set by the Match statement:
+
+  * If the MATCHED value is zero, the UM statement is ignored and control
+    passes to the next statement.
+
+  * If the MATCHED value is non-zero and less than or equal to the number
+    of labels in the procedure list of the UM statement, the procedure
+    indexed by it (counting from the left) is called.
+
+  * If the MATCHED value is out of range, the UM statement is ignored.
+
+  Example:
+
+     M:BE,AD,EX
+    JM:*BEGINNER,*ADVANCED,*EXPERT
+
+E:    (End)
+
+  Indicates the end of a procedure or the end of the current program.
+
+C:variable=expression    (Compute)
+
+  Evaluates 'expression' and assigns the result to the specified 'variable'.
+
+  Example:
+
+    C:#sum=2+2
+    C:$FullName=$First $Last
+
+R:text    (Remark)
+
+  Ignored by the interpreter, is used to enter a comment or remark.
+
+  Example:
+
+    R:This is a comment
+
+:    (repeat)
+
+  A colon alone can be used to repeat the last operation.
+
+  Example:
+
+    T:This
+     :    is
+     :      a
+     :       multi-line
+     :                 Type
+     :                     statement
+
+
+Conditionals
+------------
+
+Conditionals are an optional part of a PILOT statement, and can cause
+the statement to be skipped.
+
+The simplest kind of conditional is the letter Y or N. The Y condition is
+true if MATCHED is not zero (i.e. if the last Match succeeded), and false
+otherwise.
+
+Example:
+
+  T:Do you want to continue?
+  A:
+  M:y
+  EN:
+    ...
+
+A condition can also be a relational expression in parentheses. This kind
+of condition is true if the relation is true.
+
+Example:
+
+  T(AGE<21):You are too young to drink
+
+The condition can be an expression alone, in parentheses. In this case,
+the condition is true if the result is non-zero.
+
+Example:
+
+  T(N):#N is non-zero
+  T(N%2):#N is an odd number
+
+
+Screen control
+--------------
+
+PilotZ implements the following additional statements for working with
+VT100 and compatible video terminals:
+
+CH:    (Clear Home)
+
+  Clears the screen and homes the cursor.
+
+CL:    (Clear Line)
+
+  Clears the screen from the current cursor position to end of line.
+
+CE:    (Clear End)
+
+  Clears the screen from the current cursor position to end of screen.
+
+CA:row,column    (Cursor Address)
+
+  Positions the cursor at the specified screen location. The 'row' and
+  'column' arguments are 1-based and relative to the top-left corner of
+  the screen.
+
+
+Escape sequences
+----------------
+
+A backslash followed by certain ASCII printable characters can be used to
+produce special non-printable ASCII characters in a Type statement, in
+particular:
+
+  \a   bell
+  \b   backspace
+  \t   horizontal tab
+  \n   line feed
+  \r   carriage return
+  \e   escape
+
+In addition, the backslash can be used to escape special characters such
+as $ and # to prevent PilotZ from interpreting them as the start of a
+variable name.
+
